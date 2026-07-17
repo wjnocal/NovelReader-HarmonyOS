@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "本地 TXT 与 EPUB 阅读器"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "NovelReader 鸿蒙版"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "NovelReader"
     }
   ]
 }
