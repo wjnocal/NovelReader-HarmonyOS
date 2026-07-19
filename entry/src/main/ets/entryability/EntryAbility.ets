@@ -6,6 +6,14 @@ const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    AppStorage.setOrCreate<boolean>('appInForeground', true);
+    AppStorage.setOrCreate<string>('onlineDownloadStatus', 'idle');
+    AppStorage.setOrCreate<string>('onlineDownloadMessage', '');
+    AppStorage.setOrCreate<number>('onlineDownloadCompleted', 0);
+    AppStorage.setOrCreate<number>('onlineDownloadTotal', 0);
+    AppStorage.setOrCreate<string>('onlineDownloadTitle', '');
+    AppStorage.setOrCreate<number>('onlineDownloadUpdatedAt', 0);
+    AppStorage.setOrCreate<string>('onlineDownloadBookId', '');
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
@@ -47,11 +55,13 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     // Ability has brought to foreground
+    AppStorage.setOrCreate<boolean>('appInForeground', true);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
   }
 
   onBackground(): void {
     // Ability has back to background
+    AppStorage.setOrCreate<boolean>('appInForeground', false);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
   }
 }

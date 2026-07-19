@@ -38,6 +38,17 @@ export class BookImporter {
           parsed = await EpubParser.parse(originalPath, `${bookDir}/epub_extract`, fileName);
         }
 
+        const existing = snapshot.books.find((item: BookRecord): boolean =>
+          item.title.trim().toLowerCase() === parsed.title.trim().toLowerCase() &&
+          item.author.trim().toLowerCase() === parsed.author.trim().toLowerCase() &&
+          item.fileType === parsed.fileType);
+        if (existing !== undefined) {
+          BookImporter.updateExistingBook(context, existing, parsed, originalPath, extension);
+          LibraryStore.deleteBookFiles(context, bookId);
+          result.updatedCount++;
+          continue;
+        }
+
         const chapterFilePath = `${bookDir}/chapters.json`;
         LibraryStore.saveChapters(chapterFilePath, parsed.chapters);
         const now = Date.now();
@@ -63,6 +74,30 @@ export class BookImporter {
     snapshot.books.sort((left: BookRecord, right: BookRecord) => right.updatedAt - left.updatedAt);
     LibraryStore.save(context, snapshot);
     return result;
+  }
+
+  private static updateExistingBook(context: common.UIAbilityContext, book: BookRecord, parsed: ParsedBook,
+    importedPath: string, extension: string): void {
+    const directory = LibraryStore.bookDirectory(context, book.id);
+    const chapterPath = book.chapterFilePath === undefined || book.chapterFilePath.length === 0 ?
+      `${directory}/chapters.json` : book.chapterFilePath;
+    const originalPath = `${directory}/original.${extension}`;
+    fs.copyFileSync(importedPath, originalPath);
+    LibraryStore.saveChapters(chapterPath, parsed.chapters);
+    const now = Date.now();
+    book.title = parsed.title;
+    book.author = parsed.author;
+    book.description = parsed.description;
+    book.fileType = parsed.fileType;
+    book.originalFilePath = originalPath;
+    book.chapterFilePath = chapterPath;
+    book.totalChapters = parsed.chapters.length;
+    book.currentChapterIndex = Math.max(0, Math.min(book.currentChapterIndex, parsed.chapters.length - 1));
+    book.currentPageIndex = 0;
+    book.scrollOffset = 0;
+    book.updatedAt = now;
+    book.syncUpdatedAt = now;
+    book.syncContentHash = '';
   }
 
   private static copyPickedFile(uri: string, destination: string): void {

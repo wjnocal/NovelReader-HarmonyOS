@@ -34,6 +34,7 @@ export class BookmarkRecord {
   id: string = '';
   bookId: string = '';
   chapterIndex: number = 0;
+  pageIndex: number = 0;
   scrollOffset: number = 0;
   chapterTitle: string = '';
   summary: string = '';
@@ -92,6 +93,8 @@ export class LibrarySnapshot {
   dailyReading: Array<DailyReadingRecord> = new Array<DailyReadingRecord>();
   readingGoalMinutes: number = 30;
   bookshelfBackgroundOpacity: number = 0.32;
+  bookshelfGridMode: boolean = true;
+  bookshelfSortMode: number = 0;
   userName: string = '默认用户';
   syncDeviceId: string = '';
   profileUpdatedAt: number = 0;
@@ -109,6 +112,40 @@ export class OnlineBookResult {
   lastUpdateTime: string = '';
   status: string = '';
   url: string = '';
+}
+
+export class OnlineSourceInfo {
+  id: string = '';
+  name: string = '';
+  baseUrl: string = '';
+  enabled: boolean = true;
+  searchable: boolean = true;
+  needProxy: boolean = false;
+  comment: string = '';
+  concurrency: number = 1;
+}
+
+export class OnlineExtractionRule {
+  sourceId: string = '';
+  sourceName: string = '通用网页';
+  titleSelector: string = '';
+  contentSelector: string = '';
+  filterPattern: string = '';
+  nextPageSelector: string = '';
+  nextChapterPattern: string = '';
+}
+
+export class OnlineBookGroup {
+  title: string = '';
+  author: string = '';
+  score: number = 0;
+  versions: Array<OnlineBookResult> = new Array<OnlineBookResult>();
+}
+
+export class OnlineDownloadProgress {
+  message: string = '';
+  completed: number = 0;
+  total: number = 0;
 }
 
 export class WebDavConfig {
@@ -135,6 +172,8 @@ export class BackupDocument {
   dailyReading: Array<DailyReadingRecord> = new Array<DailyReadingRecord>();
   readingGoalMinutes: number = 30;
   bookshelfBackgroundOpacity: number = 0.32;
+  bookshelfGridMode: boolean = true;
+  bookshelfSortMode: number = 0;
   userName: string = '默认用户';
 }
 
@@ -148,5 +187,6 @@ export class ParsedBook {
 
 export class ImportResult {
   books: Array<BookRecord> = new Array<BookRecord>();
+  updatedCount: number = 0;
   errors: Array<string> = new Array<string>();
 }

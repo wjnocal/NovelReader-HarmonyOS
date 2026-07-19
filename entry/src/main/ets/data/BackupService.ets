@@ -20,6 +20,8 @@ export class BackupService {
     document.dailyReading = snapshot.dailyReading;
     document.readingGoalMinutes = snapshot.readingGoalMinutes;
     document.bookshelfBackgroundOpacity = snapshot.bookshelfBackgroundOpacity;
+    document.bookshelfGridMode = snapshot.bookshelfGridMode;
+    document.bookshelfSortMode = snapshot.bookshelfSortMode;
     document.userName = snapshot.userName;
     document.bookmarks = snapshot.bookmarks;
     document.notes = snapshot.notes;
@@ -62,9 +64,28 @@ export class BackupService {
     const idMap = new Map<string, string>();
     let restored = 0;
     document.books.forEach((item: BackupBookRecord, index: number) => {
-      const duplicated = snapshot.books.some((existing: BookRecord) => existing.title === item.book.title &&
-        existing.author === item.book.author);
-      if (duplicated) {
+      const existing = snapshot.books.find((book: BookRecord): boolean => book.title === item.book.title &&
+        book.author === item.book.author);
+      if (existing !== undefined) {
+        const chapterPath = existing.chapterFilePath.length > 0 ? existing.chapterFilePath :
+          `${LibraryStore.bookDirectory(context, existing.id)}/chapters.json`;
+        LibraryStore.saveChapters(chapterPath, item.chapters);
+        idMap.set(item.book.id, existing.id);
+        existing.fileType = item.book.fileType;
+        existing.category = item.book.category;
+        existing.description = item.book.description;
+        existing.originalFilePath = '';
+        existing.chapterFilePath = chapterPath;
+        existing.totalChapters = item.chapters.length;
+        existing.currentChapterIndex = Math.max(0, Math.min(item.book.currentChapterIndex, item.chapters.length - 1));
+        existing.currentPageIndex = Math.max(0, item.book.currentPageIndex);
+        existing.scrollOffset = Math.max(0, item.book.scrollOffset);
+        existing.pinnedAt = item.book.pinnedAt;
+        existing.finishedAt = item.book.finishedAt;
+        existing.updatedAt = Date.now();
+        existing.syncUpdatedAt = existing.updatedAt;
+        existing.syncContentHash = '';
+        restored++;
         return;
       }
       const newId = `${Date.now()}_restore_${index}`;
@@ -86,9 +107,17 @@ export class BackupService {
         const newBookId = idMap.get(source.bookId);
         if (newBookId !== undefined) {
           const bookmark = BackupService.copyBookmark(source);
-          bookmark.id = `${Date.now()}_bookmark_${snapshot.bookmarks.length}`;
           bookmark.bookId = newBookId;
-          snapshot.bookmarks.push(bookmark);
+          const duplicated = snapshot.bookmarks.some((existing: BookmarkRecord): boolean =>
+            existing.bookId === newBookId && existing.chapterIndex === bookmark.chapterIndex &&
+            existing.pageIndex === bookmark.pageIndex && Math.abs(existing.scrollOffset - bookmark.scrollOffset) < 1 &&
+            existing.summary === bookmark.summary);
+          if (!duplicated) {
+            bookmark.id = `${Date.now()}_bookmark_${snapshot.bookmarks.length}`;
+            bookmark.syncId = '';
+            bookmark.updatedAt = Date.now();
+            snapshot.bookmarks.push(bookmark);
+          }
         }
       });
     }
@@ -97,9 +126,16 @@ export class BackupService {
         const newBookId = idMap.get(source.bookId);
         if (newBookId !== undefined) {
           const note = BackupService.copyNote(source);
-          note.id = `${Date.now()}_note_${snapshot.notes.length}`;
           note.bookId = newBookId;
-          snapshot.notes.push(note);
+          const duplicated = snapshot.notes.some((existing: NoteRecord): boolean => existing.bookId === newBookId &&
+            existing.chapterIndex === note.chapterIndex && existing.paragraphIndex === note.paragraphIndex &&
+            existing.selectedText === note.selectedText && existing.noteText === note.noteText);
+          if (!duplicated) {
+            note.id = `${Date.now()}_note_${snapshot.notes.length}`;
+            note.syncId = '';
+            note.updatedAt = Date.now();
+            snapshot.notes.push(note);
+          }
         }
       });
     }
@@ -114,6 +150,12 @@ export class BackupService {
     }
     if (document.bookshelfBackgroundOpacity >= 0.15 && document.bookshelfBackgroundOpacity <= 0.95) {
       snapshot.bookshelfBackgroundOpacity = document.bookshelfBackgroundOpacity;
+    }
+    if (typeof document.bookshelfGridMode === 'boolean') {
+      snapshot.bookshelfGridMode = document.bookshelfGridMode;
+    }
+    if (document.bookshelfSortMode >= 0 && document.bookshelfSortMode <= 2) {
+      snapshot.bookshelfSortMode = document.bookshelfSortMode;
     }
     if (document.userName !== undefined && document.userName.trim().length > 0) {
       snapshot.userName = document.userName;
@@ -160,6 +202,7 @@ export class BackupService {
     bookmark.id = source.id;
     bookmark.bookId = source.bookId;
     bookmark.chapterIndex = source.chapterIndex;
+    bookmark.pageIndex = source.pageIndex;
     bookmark.scrollOffset = source.scrollOffset;
     bookmark.chapterTitle = source.chapterTitle;
     bookmark.summary = source.summary;
@@ -176,6 +219,8 @@ export class BackupService {
     note.selectedText = source.selectedText;
     note.noteText = source.noteText;
     note.color = source.color;
+    note.textStartOffset = source.textStartOffset;
+    note.textEndOffset = source.textEndOffset;
     note.createdAt = source.createdAt;
     note.updatedAt = source.updatedAt;
     return note;

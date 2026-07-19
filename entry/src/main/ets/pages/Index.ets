@@ -81,6 +81,9 @@ struct Index {
   @State private readerThemeMode: number = 0;
   @State private readerPageMargin: number = 22;
   @State private readerReadMode: number = 1;
+  @StorageLink('appInForeground') @Watch('onAppForegroundChanged') private appInForeground: boolean = true;
+  @StorageLink('onlineDownloadStatus') @Watch('onOnlineDownloadStatusChanged')
+  private backgroundDownloadStatus: string = 'idle';
   @State private readerPages: Array<string> = new Array<string>();
   @State private readerCurrentPageText: string = '';
   @State private readerPageParagraphStarts: Array<number> = new Array<number>();
@@ -141,6 +144,27 @@ struct Index {
     this.reloadLibrary();
   }
 
+  private onOnlineDownloadStatusChanged(): void {
+    if (this.backgroundDownloadStatus === 'completed') {
+      this.reloadLibrary();
+    }
+  }
+
+  private onAppForegroundChanged(): void {
+    if (this.page !== 'reader') {
+      return;
+    }
+    if (this.appInForeground) {
+      this.readerSessionStartedAt = Date.now();
+      return;
+    }
+    if (this.readerReadMode === 1) {
+      this.updateScrollOffset();
+    }
+    this.persistProgress();
+    this.readerSessionStartedAt = 0;
+  }
+
   onBackPress(): boolean {
     if (this.readerSelectionStart >= 0) {
       this.closeReaderSelection();
@@ -195,6 +219,8 @@ struct Index {
     this.books = this.sortedBooks(this.snapshot.books);
     this.syncReaderSettingsState();
     this.backgroundOpacity = this.snapshot.bookshelfBackgroundOpacity;
+    this.gridMode = this.snapshot.bookshelfGridMode;
+    this.sortMode = this.snapshot.bookshelfSortMode;
     this.profileNameDraft = this.snapshot.userName;
   }
 
@@ -230,7 +256,8 @@ struct Index {
   private visibleBooks(): Array<BookRecord> {
     const keyword = this.searchQuery.trim().toLowerCase();
     let filtered = keyword.length === 0 ? this.snapshot.books : this.snapshot.books.filter((book: BookRecord) =>
-      book.title.toLowerCase().indexOf(keyword) >= 0 || book.author.toLowerCase().indexOf(keyword) >= 0);
+      book.title.toLowerCase().indexOf(keyword) >= 0 || book.author.toLowerCase().indexOf(keyword) >= 0 ||
+        book.category.toLowerCase().indexOf(keyword) >= 0 || book.description.toLowerCase().indexOf(keyword) >= 0);
     if (this.categoryFilter === '正在阅读') {
       filtered = filtered.filter((book: BookRecord) => book.finishedAt === 0);
     } else if (this.categoryFilter === '已读完') {
@@ -331,12 +358,12 @@ struct Index {
     this.onlineStatus = `准备下载《${result.bookName}》`;
     try {
       const service = new OnlineBookService(this.context());
-      const book = await service.downloadToLibrary(result, (message: string): void => {
+      const book = await service.downloadToLibrary(result, 'txt', (message: string): void => {
         this.onlineStatus = message;
       });
       this.reloadLibrary();
-      this.onlineStatus = `《${book.title}》已加入书架`;
-      promptAction.showToast({ message: '下载完成，已加入书架' });
+      this.onlineStatus = `《${book.title}》已下载到书架`;
+      promptAction.showToast({ message: '下载完成，书架已更新' });
     } catch (error) {
       this.onlineStatus = `下载失败：${ErrorText.from(error as BusinessError)}`;
     } finally {
@@ -350,7 +377,7 @@ struct Index {
     this.webDavUsername = config.username;
     this.webDavPassword = config.password;
     this.webDavStatus = config.lastStatus;
-    this.webDavProgress = config.lastSyncAt > 0 ? 100 : 0;
+    this.webDavProgress = config.lastSyncAt > 0 && config.lastStatus === '同步完成' ? 100 : 0;
   }
 
   private webDavConfig(): WebDavConfig {
@@ -386,10 +413,18 @@ struct Index {
       const service = new WebDavSyncService(this.context());
       const config = this.webDavConfig();
       await service.test(config);
+      config.lastStatus = '连接成功';
       service.saveConfig(config);
       this.webDavStatus = '连接成功';
     } catch (error) {
       this.webDavStatus = `连接失败：${ErrorText.from(error as BusinessError)}`;
+      try {
+        const config = this.webDavConfig();
+        config.lastStatus = this.webDavStatus;
+        new WebDavSyncService(this.context()).saveConfig(config);
+      } catch (saveError) {
+        // Keep the actionable connection error visible even if persisting the status fails.
+      }
     } finally {
       this.webDavBusy = false;
     }
@@ -413,6 +448,13 @@ struct Index {
       promptAction.showToast({ message: 'WebDAV 同步完成' });
     } catch (error) {
       this.webDavStatus = `同步失败：${ErrorText.from(error as BusinessError)}`;
+      try {
+        const config = this.webDavConfig();
+        config.lastStatus = this.webDavStatus;
+        new WebDavSyncService(this.context()).saveConfig(config);
+      } catch (saveError) {
+        // Keep the actionable sync error visible even if persisting the status fails.
+      }
     } finally {
       this.webDavBusy = false;
     }
@@ -439,6 +481,9 @@ struct Index {
         value: '清除',
         fontColor: '#B74434',
         action: () => {
+          this.snapshot.dailyReading.forEach((daily: DailyReadingRecord): void => {
+            this.recordSyncDeletion('reading', daily.syncId);
+          });
           this.snapshot.dailyReading = new Array<DailyReadingRecord>();
           LibraryStore.save(this.context(), this.snapshot);
           this.snapshot = LibraryStore.load(this.context());
@@ -477,9 +522,28 @@ struct Index {
 
   private cycleSortMode(): void {
     this.sortMode = (this.sortMode + 1) % 3;
+    this.snapshot.bookshelfSortMode = this.sortMode;
+    LibraryStore.save(this.context(), this.snapshot);
     this.books = this.visibleBooks();
     promptAction.showToast({ message: this.sortMode === 0 ? '按最近阅读排序' :
       (this.sortMode === 1 ? '按书名排序' : '按阅读进度排序') });
+    this.toggleMoreMenu();
+  }
+
+  private openOnlineSearch(): void {
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/OnlineSearch' });
+  }
+
+  private openBrowser(): void {
+    this.moreMenuVisible = false;
+    this.moreMenuProgress = 0;
+    this.getUIContext().getRouter().pushUrl({ url: 'pages/Browser' });
+  }
+
+  private toggleGridMode(): void {
+    this.gridMode = !this.gridMode;
+    this.snapshot.bookshelfGridMode = this.gridMode;
+    LibraryStore.save(this.context(), this.snapshot);
     this.toggleMoreMenu();
   }
 
@@ -508,24 +572,47 @@ struct Index {
 
   private openBookmark(bookmark: BookmarkRecord): void {
     this.chapterIndex = Math.max(0, Math.min(bookmark.chapterIndex, this.chapters.length - 1));
+    this.readerPageIndex = Math.max(0, bookmark.pageIndex);
+    this.rebuildReaderPages(this.readerPageIndex);
     const book = this.currentBook();
     if (book !== undefined) {
       book.currentChapterIndex = this.chapterIndex;
+      book.currentPageIndex = this.readerPageIndex;
       book.scrollOffset = bookmark.scrollOffset;
     }
     this.closeCatalog();
-    setTimeout((): void => {
-      this.readerScroller.scrollTo({ xOffset: 0, yOffset: bookmark.scrollOffset });
-    }, 280);
+    if (this.readerReadMode === 1) {
+      setTimeout((): void => {
+        this.readerScroller.scrollTo({ xOffset: 0, yOffset: bookmark.scrollOffset });
+      }, 280);
+    }
     this.persistProgress();
   }
 
   private openDrawerNote(note: NoteRecord): void {
     this.chapterIndex = Math.max(0, Math.min(note.chapterIndex, this.chapters.length - 1));
+    const paragraphs = this.paragraphs();
+    const paragraphIndex = Math.max(0, Math.min(note.paragraphIndex, paragraphs.length - 1));
+    this.rebuildReaderPages(0);
+    const absoluteOffset = note.textStartOffset >= 0 ? note.textStartOffset :
+      this.paragraphAbsoluteStart(paragraphIndex);
+    this.readerPageIndex = this.pageIndexForAbsoluteOffset(absoluteOffset);
+    this.rebuildReaderPages(this.readerPageIndex);
+    const scrollOffset = this.estimatedParagraphScrollOffset(paragraphIndex);
+    const book = this.currentBook();
+    if (book !== undefined) {
+      book.currentChapterIndex = this.chapterIndex;
+      book.currentPageIndex = this.readerPageIndex;
+      book.scrollOffset = scrollOffset;
+    }
     this.closeCatalog();
     setTimeout((): void => {
-      this.openNoteEditor(note.paragraphIndex, note);
+      if (this.readerReadMode === 1) {
+        this.readerScroller.scrollTo({ xOffset: 0, yOffset: scrollOffset });
+      }
+      this.openNoteEditor(paragraphIndex, note);
     }, 280);
+    this.persistProgress();
   }
 
   private closeCatalog(): void {
@@ -596,6 +683,9 @@ struct Index {
       this.reloadLibrary();
       if (result.books.length > 0) {
         promptAction.showToast({ message: `已导入 ${result.books.length} 本书` });
+      }
+      if (result.updatedCount > 0) {
+        promptAction.showToast({ message: `已更新 ${result.updatedCount} 本重复书籍` });
       }
       if (result.errors.length > 0) {
         promptAction.showToast({ message: result.errors[0] });
@@ -883,6 +973,27 @@ struct Index {
       this.readerPageTextStarts[this.readerPageIndex] : 0;
   }
 
+  private pageIndexForAbsoluteOffset(offset: number): number {
+    for (let index = this.readerPageTextStarts.length - 1; index >= 0; index--) {
+      if (offset >= this.readerPageTextStarts[index]) {
+        return index;
+      }
+    }
+    return 0;
+  }
+
+  private estimatedParagraphScrollOffset(paragraphIndex: number): number {
+    const paragraphs = this.paragraphs();
+    const safeIndex = Math.max(0, Math.min(paragraphIndex, paragraphs.length - 1));
+    const charactersPerLine = this.estimatedCharactersPerLine();
+    const lineHeight = this.readerTextSize * this.readerLineHeight;
+    let offset = this.readerSafeTop() + (this.readerTextSize + 5) * this.readerLineHeight + 32;
+    for (let index = 0; index < safeIndex; index++) {
+      offset += Math.max(1, Math.ceil((paragraphs[index].length + 2) / charactersPerLine)) * lineHeight + 15;
+    }
+    return Math.max(0, offset);
+  }
+
   private updateReaderSelection(text: string, absoluteStart: number, controller: TextController,
     selectionStart: number, selectionEnd: number): void {
     if (selectionStart < 0 || selectionEnd <= selectionStart || selectionStart >= text.length) {
@@ -1016,7 +1127,9 @@ struct Index {
   }
 
   private saveReaderMark(color: string): void {
-    if (this.readerSelectionStart < 0 || this.readerSelectionEnd <= this.readerSelectionStart) {
+    const selectedText = this.selectedReaderText().trim();
+    if (this.readerSelectionStart < 0 || this.readerSelectionEnd <= this.readerSelectionStart ||
+      selectedText.length === 0) {
       return;
     }
     const note = new NoteRecord();
@@ -1024,7 +1137,7 @@ struct Index {
     note.bookId = this.currentBookId;
     note.chapterIndex = this.chapterIndex;
     note.paragraphIndex = this.readerSelectionParagraphIndex;
-    note.selectedText = this.selectedReaderText().trim();
+    note.selectedText = selectedText;
     note.noteText = '';
     note.color = color;
     note.textStartOffset = this.readerSelectionStart;
@@ -1039,6 +1152,13 @@ struct Index {
   }
 
   private deleteReaderMarks(): void {
+    const removed = this.snapshot.notes.filter((note: NoteRecord): boolean => {
+      if (note.bookId !== this.currentBookId || note.chapterIndex !== this.chapterIndex ||
+        note.noteText.trim().length > 0) return false;
+      const range = this.noteTextRange(note);
+      return range !== undefined && range.end > this.readerSelectionStart && range.start < this.readerSelectionEnd;
+    });
+    removed.forEach((note: NoteRecord): void => this.recordSyncDeletion('note', note.syncId));
     this.snapshot.notes = this.snapshot.notes.filter((note: NoteRecord): boolean => {
       if (note.bookId !== this.currentBookId || note.chapterIndex !== this.chapterIndex ||
         note.noteText.trim().length > 0) {
@@ -1070,12 +1190,14 @@ struct Index {
 
   private commentReaderSelection(): void {
     const paragraphIndex = this.readerSelectionParagraphIndex;
+    const selectionStart = this.readerSelectionStart;
+    const selectionEnd = this.readerSelectionEnd;
+    const selectedText = this.selectedReaderText().trim();
     this.closeReaderSelection();
     const paragraphs = this.paragraphs();
     if (paragraphIndex >= 0 && paragraphIndex < paragraphs.length) {
-      const start = this.paragraphAbsoluteStart(paragraphIndex);
-      this.openNoteEditor(paragraphIndex, undefined, start, start + 2 + paragraphs[paragraphIndex].length,
-        paragraphs[paragraphIndex]);
+      this.openNoteEditor(paragraphIndex, undefined, selectionStart, selectionEnd,
+        selectedText.length > 0 ? selectedText : paragraphs[paragraphIndex]);
     }
   }
 
@@ -1363,8 +1485,11 @@ struct Index {
 
   private todayReadingMillis(): number {
     const key = this.localDateKey(Date.now());
-    const record = this.snapshot.dailyReading.find((item: DailyReadingRecord) => item.date === key);
-    return record === undefined ? 0 : record.readingMillis;
+    let total = 0;
+    this.snapshot.dailyReading.forEach((item: DailyReadingRecord): void => {
+      if (item.date === key) total += item.readingMillis;
+    });
+    return total;
   }
 
   private totalReadingMillis(): number {
@@ -1403,8 +1528,11 @@ struct Index {
     cursor.setDate(cursor.getDate() - 6);
     for (let index = 0; index < 7; index++) {
       const key = this.localDateKey(cursor.getTime());
-      const found = this.snapshot.dailyReading.find((item: DailyReadingRecord) => item.date === key);
-      result.push(new DailyReadingRecord(key.substring(5), found === undefined ? 0 : found.readingMillis));
+      let readingMillis = 0;
+      this.snapshot.dailyReading.forEach((item: DailyReadingRecord): void => {
+        if (item.date === key) readingMillis += item.readingMillis;
+      });
+      result.push(new DailyReadingRecord(key.substring(5), readingMillis));
       cursor.setDate(cursor.getDate() + 1);
     }
     return result;
@@ -1424,11 +1552,21 @@ struct Index {
 
   private saveSelectedBookDetails(): void {
     const book = this.selectedBook();
-    if (book === undefined || this.bookTitleDraft.trim().length === 0) {
+    const title = this.bookTitleDraft.trim();
+    const category = this.bookCategoryDraft.trim().length === 0 ? '未分类' : this.bookCategoryDraft.trim();
+    if (book === undefined || title.length === 0) {
       return;
     }
-    book.title = this.bookTitleDraft.trim();
-    book.category = this.bookCategoryDraft.trim().length === 0 ? '未分类' : this.bookCategoryDraft.trim();
+    if (title.length > 80 || category.length > 20) {
+      promptAction.showToast({ message: '书名最多 80 字，分类最多 20 字' });
+      return;
+    }
+    if (category === '全部' || category === '正在阅读' || category === '已读完') {
+      promptAction.showToast({ message: '该分类名为系统筛选项，请更换名称' });
+      return;
+    }
+    book.title = title;
+    book.category = category;
     book.updatedAt = Date.now();
     book.syncUpdatedAt = book.updatedAt;
     LibraryStore.save(this.context(), this.snapshot);
@@ -1469,10 +1607,11 @@ struct Index {
     }
   }
 
-  private updateScrollOffset(offset: number): void {
+  private updateScrollOffset(): void {
     const book = this.currentBook();
     if (book !== undefined) {
-      book.scrollOffset = Math.max(0, offset);
+      const current = this.readerScroller.currentOffset();
+      book.scrollOffset = Math.max(0, current.yOffset);
     }
   }
 
@@ -1546,7 +1685,10 @@ struct Index {
     if (book.totalChapters <= 0) {
       return 0;
     }
-    return Math.min(100, Math.floor((book.currentChapterIndex + 1) * 100 / book.totalChapters));
+    if (book.finishedAt > 0) {
+      return 100;
+    }
+    return Math.min(99, Math.floor(book.currentChapterIndex * 100 / book.totalChapters));
   }
 
   private notesAt(paragraphIndex: number): Array<NoteRecord> {
@@ -1582,6 +1724,7 @@ struct Index {
     const existing = this.snapshot.notes.find((note: NoteRecord) => note.id === this.editingNoteId);
     if (existing !== undefined) {
       existing.noteText = content;
+      existing.paragraphIndex = this.noteParagraphIndex;
       existing.updatedAt = Date.now();
     } else {
       const paragraphs = this.paragraphs();
@@ -1620,13 +1763,21 @@ struct Index {
   }
 
   private isCurrentBookmarked(): boolean {
-    return this.snapshot.bookmarks.some((bookmark: BookmarkRecord) => bookmark.bookId === this.currentBookId &&
-      bookmark.chapterIndex === this.chapterIndex);
+    const book = this.currentBook();
+    return this.snapshot.bookmarks.some((bookmark: BookmarkRecord): boolean => {
+      if (bookmark.bookId !== this.currentBookId || bookmark.chapterIndex !== this.chapterIndex) return false;
+      return this.readerReadMode === 0 ? bookmark.pageIndex === this.readerPageIndex :
+        book !== undefined && Math.abs(bookmark.scrollOffset - book.scrollOffset) < 80;
+    });
   }
 
   private toggleBookmark(): void {
-    const existing = this.snapshot.bookmarks.find((bookmark: BookmarkRecord) => bookmark.bookId === this.currentBookId &&
-      bookmark.chapterIndex === this.chapterIndex);
+    const book = this.currentBook();
+    const existing = this.snapshot.bookmarks.find((bookmark: BookmarkRecord): boolean => {
+      if (bookmark.bookId !== this.currentBookId || bookmark.chapterIndex !== this.chapterIndex) return false;
+      return this.readerReadMode === 0 ? bookmark.pageIndex === this.readerPageIndex :
+        book !== undefined && Math.abs(bookmark.scrollOffset - book.scrollOffset) < 80;
+    });
     if (existing !== undefined) {
       this.recordSyncDeletion('bookmark', existing.syncId);
       this.snapshot.bookmarks = this.snapshot.bookmarks.filter((bookmark: BookmarkRecord) => bookmark.id !== existing.id);
@@ -1635,11 +1786,12 @@ struct Index {
       bookmark.id = `${Date.now()}_${this.chapterIndex}`;
       bookmark.bookId = this.currentBookId;
       bookmark.chapterIndex = this.chapterIndex;
+      bookmark.pageIndex = this.readerPageIndex;
       bookmark.chapterTitle = this.currentChapter().title;
-      bookmark.summary = this.currentChapter().content.substring(0, Math.min(80, this.currentChapter().content.length));
+      const summarySource = this.readerReadMode === 0 ? this.currentPagedText() : this.currentChapter().content;
+      bookmark.summary = summarySource.substring(0, Math.min(80, summarySource.length)).trim();
       bookmark.createdAt = Date.now();
       bookmark.updatedAt = bookmark.createdAt;
-      const book = this.currentBook();
       bookmark.scrollOffset = book === undefined ? 0 : book.scrollOffset;
       this.snapshot.bookmarks.push(bookmark);
     }
@@ -1753,7 +1905,7 @@ struct Index {
             .width('100%')
 
             if (this.searchVisible) {
-              TextInput({ text: this.searchQuery, placeholder: '搜索书名或作者' })
+              TextInput({ text: this.searchQuery, placeholder: '搜索书名、作者、分类或简介' })
                 .height(44)
                 .fontSize(16)
                 .backgroundColor('#EFFFFFFF')
@@ -1765,17 +1917,21 @@ struct Index {
 
             if (this.visibleBooks().length === 0) {
               Column() {
-                Text(this.searchQuery.length > 0 ? '没有匹配的书籍' : '书架还是空的')
+                Text(this.searchQuery.length > 0 ? '没有匹配的书籍' :
+                  (this.categoryFilter !== '全部' ? '当前筛选下没有书籍' : '书架还是空的'))
                   .fontSize(20)
                   .fontWeight(FontWeight.Bold)
                   .fontColor('#333333')
-                Button(this.searchQuery.length > 0 ? '清除搜索' : '本机导入')
+                Button(this.searchQuery.length > 0 ? '清除搜索' :
+                  (this.categoryFilter !== '全部' ? '查看全部书籍' : '本机导入'))
                   .fontColor('#111111')
                   .backgroundColor('#CFFFFFFF')
                   .margin({ top: 18 })
                   .onClick(() => {
                     if (this.searchQuery.length > 0) {
                       this.searchQuery = '';
+                    } else if (this.categoryFilter !== '全部') {
+                      this.categoryFilter = '全部';
                     } else {
                       this.importBooks();
                     }
@@ -1879,6 +2035,9 @@ struct Index {
                     .borderRadius(8)
                     .border({ width: 1, color: '#80FFFFFF' })
                     .onClick(() => this.openBook(book))
+                    .gesture(LongPressGesture().onAction(() => {
+                      this.openBookActions(book);
+                    }))
                   }
                 }, (book: BookRecord) => this.bookRenderKey(book))
               }
@@ -1917,6 +2076,7 @@ struct Index {
         .shadow({ radius: 8, color: '#33000000', offsetY: 3 })
       }
       .padding({ left: 20, right: 20 })
+      .safeAreaPadding({ top: 8 })
       .width('100%')
       .height('100%')
       .opacity(this.pageProgress)
@@ -1941,8 +2101,7 @@ struct Index {
             .height(52)
             .padding({ left: 18 })
             .onClick(() => {
-              this.gridMode = !this.gridMode;
-              this.toggleMoreMenu();
+              this.toggleGridMode();
             })
           Text('导入记录')
             .fontSize(16)
@@ -2013,8 +2172,15 @@ struct Index {
             .height(52)
             .padding({ left: 18 })
             .onClick(() => {
-              this.openUtility('online');
+              this.openOnlineSearch();
             })
+          Text('内置浏览器')
+            .fontSize(16)
+            .fontColor('#111111')
+            .width('100%')
+            .height(52)
+            .padding({ left: 18 })
+            .onClick(() => this.openBrowser())
         }
         .width(220)
         .padding({ top: 10, bottom: 10 })
@@ -2089,7 +2255,8 @@ struct Index {
         this.HomeAction('本机导入', '导入 TXT 或 EPUB', () => {
           this.importBooks();
         })
-        this.HomeAction('在线搜书', '搜索书源并直接下载到书架', () => this.openUtility('online'))
+        this.HomeAction('在线搜书', '选书源搜索并以 TXT / EPUB 后台下载', () => this.openOnlineSearch())
+        this.HomeAction('内置浏览器', '浏览小说站点并直接进入在线阅读', () => this.openBrowser())
         this.HomeAction('WebDAV 同步', '与安卓端同步书籍、进度、书签和笔记', () => this.openUtility('webdav'))
         this.HomeAction('备份数据', '导出书籍、进度、书签与笔记', () => {
           this.exportBackup();
@@ -2260,16 +2427,9 @@ struct Index {
           Slider({ value: this.snapshot.readingGoalMinutes, min: 5, max: 180, step: 5 })
             .selectedColor('#486555')
             .onChange((value: number) => {
-              this.snapshot.readingGoalMinutes = Math.round(value);
-              const changed = new LibrarySnapshot();
-              changed.books = this.snapshot.books;
-              changed.bookmarks = this.snapshot.bookmarks;
-              changed.notes = this.snapshot.notes;
-              changed.settings = this.snapshot.settings;
-              changed.dailyReading = this.snapshot.dailyReading;
-              changed.readingGoalMinutes = this.snapshot.readingGoalMinutes;
-              changed.bookshelfBackgroundOpacity = this.snapshot.bookshelfBackgroundOpacity;
-              this.snapshot = changed;
+              const changed = JSON.parse(JSON.stringify(this.snapshot)) as LibrarySnapshot;
+              changed.readingGoalMinutes = Math.round(value);
+              this.snapshot = LibraryStore.normalizeSnapshot(changed);
               LibraryStore.save(this.context(), this.snapshot);
             })
           Row() {
@@ -2549,7 +2709,7 @@ struct Index {
             .backgroundColor('#F8ECE9')
             .margin({ top: 12 })
             .onClick(() => this.confirmClearReadingStats())
-          Text('NovelReader HarmonyOS\n支持 TXT / EPUB 本地阅读、书签、笔记、统计和备份恢复。')
+          Text('小说阅读器 HarmonyOS\n支持 TXT / EPUB 本地阅读、书签、笔记、统计和备份恢复。')
             .fontSize(14)
             .fontColor('#737A75')
             .textAlign(TextAlign.Center)
@@ -2557,6 +2717,7 @@ struct Index {
             .margin({ top: 24, bottom: 12 })
         } else if (this.utilityPage === 'book') {
           TextInput({ text: this.bookTitleDraft, placeholder: '书名' })
+            .maxLength(80)
             .height(48)
             .fontSize(16)
             .backgroundColor('#F1F3EF')
@@ -2564,6 +2725,7 @@ struct Index {
             .margin({ top: 18 })
             .onChange((value: string) => this.bookTitleDraft = value)
           TextInput({ text: this.bookCategoryDraft, placeholder: '分类' })
+            .maxLength(20)
             .height(48)
             .fontSize(16)
             .backgroundColor('#F1F3EF')
@@ -2706,7 +2868,7 @@ struct Index {
 
   @Builder
   private PagedText() {
-    Text(undefined) {
+    Text(undefined, { controller: this.currentPagedTextController() }) {
       ForEach(this.readerTextSegments(this.currentSelectablePageText(),
         this.currentSelectablePageAbsoluteStart(), this.chapterIndex),
         (segment: ReaderTextSegment, index: number) => {
@@ -2724,6 +2886,16 @@ struct Index {
     .lineHeight(this.readerTextSize * this.readerLineHeight)
     .width('100%')
     .id(`reader_page_${this.chapterIndex}_${this.readerPageIndex}_${this.currentSelectablePageAbsoluteStart()}`)
+    .textSelectable(TextSelectableMode.SELECTABLE_FOCUSABLE)
+    .copyOption(CopyOptions.LocalDevice)
+    .bindSelectionMenu(TextSpanType.TEXT, this.ReaderSelectionMenu, TextResponseType.LONG_PRESS, {
+      onAppear: (): void => this.showReaderSelectionMenu(),
+      onDisappear: (): void => this.hideReaderSelectionMenu()
+    })
+    .onTextSelectionChange((selectionStart: number, selectionEnd: number): void => {
+      this.updateReaderSelection(this.currentSelectablePageText(), this.currentSelectablePageAbsoluteStart(),
+        this.currentPagedTextController(), selectionStart, selectionEnd);
+    })
   }
 
   @Builder
@@ -2852,7 +3024,7 @@ struct Index {
         .width('25%')
         .textAlign(TextAlign.Center)
         .onClick(() => this.toggleBookmark())
-      Text(this.readerReadMode === 0 ? '翻页阅读' : '长按笔记')
+      Text(this.readerReadMode === 0 ? '长按标记' : '长按笔记')
         .fontSize(13)
         .fontColor('#B8B3AD')
         .width('25%')
@@ -2959,8 +3131,11 @@ struct Index {
         }
         .layoutWeight(1)
         .scrollBar(BarState.Off)
-        .onScroll((xOffset: number, yOffset: number) => this.updateScrollOffset(yOffset))
-          .onScrollStop(() => this.persistProgress())
+        .onDidScroll(() => this.updateScrollOffset())
+        .onScrollStop(() => {
+          this.updateScrollOffset();
+          this.persistProgress();
+        })
         } else {
           this.PagedReader()
         }
@@ -3204,6 +3379,20 @@ struct Index {
               }
             })
 
+          Text(`页边距  ${Math.round(this.readerPageMargin)}`)
+            .fontSize(14)
+            .fontColor('#687169')
+            .width('100%')
+            .margin({ top: 12 })
+          Slider({ value: this.readerPageMargin, min: 12, max: 40, step: 2 })
+            .selectedColor('#486555')
+            .onChange((value: number) => {
+              this.readerPageMargin = value;
+              if (this.readerReadMode === 0) {
+                this.rebuildReaderPages();
+              }
+            })
+
           Row() {
             ForEach(['默认', '纸张', '护眼', '夜间'], (label: string, index: number) => {
               Text(label)
@@ -3253,13 +3442,15 @@ struct Index {
               .onClick(() => this.closeNoteEditor())
           }
           .width('100%')
-          Text(this.noteParagraphIndex >= 0 ? this.paragraphs()[this.noteParagraphIndex] : '')
+          Text(this.noteParagraphIndex >= 0 && this.noteParagraphIndex < this.paragraphs().length ?
+            this.paragraphs()[this.noteParagraphIndex] : '')
             .fontSize(14)
             .fontColor('#6C756F')
             .maxLines(3)
             .width('100%')
             .margin({ top: 14, bottom: 12 })
           TextArea({ text: this.noteDraft, placeholder: '记录你的想法…' })
+            .maxLength(2000)
             .fontSize(16)
             .height(120)
             .backgroundColor('#F3F5F1')

@@ -42,15 +42,15 @@ export class EpubParser {
         const idRef = EpubParser.attribute(spineMatch[0], 'idref');
         const item = EpubParser.findManifestItem(manifest, idRef);
         if (item !== undefined && item.href.length > 0) {
-          const relativePath = EpubParser.normalizePath(`${basePath}${item.href}`);
+          const relativePath = EpubParser.normalizeHref(`${basePath}${item.href}`);
           try {
             const html = fs.readTextSync(`${extractDir}/${relativePath}`);
-            const content = EpubParser.htmlToText(html);
+            let title = tocTitles.get(EpubParser.normalizeHref(item.href));
+            if (title === undefined || title.length === 0) {
+              title = EpubParser.firstHeading(html, `第 ${chapterNumber} 章`);
+            }
+            const content = EpubParser.removeLeadingTitle(EpubParser.htmlToText(html), title);
             if (content.length > 0) {
-              let title = tocTitles.get(EpubParser.normalizeHref(item.href));
-              if (title === undefined || title.length === 0) {
-                title = EpubParser.firstHeading(html, `第 ${chapterNumber} 章`);
-              }
               parsed.chapters.push(new ChapterRecord(title, content));
               chapterNumber++;
             }
@@ -97,21 +97,39 @@ export class EpubParser {
       }
       try {
         const toc = fs.readTextSync(`${extractDir}/${EpubParser.normalizePath(`${basePath}${item.href}`)}`);
-        const linkPattern = /<(?:a|content)\b[^>]*(?:href|src)\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>|<content\b[^>]*src\s*=\s*(["'])(.*?)\4[^>]*\/>/gi;
-        let match: RegExpExecArray | null = linkPattern.exec(toc);
-        while (match !== null) {
-          const href = match[2] !== undefined ? match[2] : match[5];
-          const rawTitle = match[3] !== undefined ? match[3] : '';
-          const title = EpubParser.htmlToText(rawTitle);
-          if (href !== undefined && title.length > 0) {
-            titles.set(EpubParser.normalizeHref(href), title);
-          }
-          match = linkPattern.exec(toc);
-        }
+        const tocBase = EpubParser.parentPath(item.href);
+        EpubParser.navigationTitles(toc).forEach((title: string, href: string): void => {
+          titles.set(EpubParser.normalizeHref(`${tocBase}${href}`), title);
+        });
       } catch (error) {
         // A broken TOC should not prevent reading spine content.
       }
     });
+    return titles;
+  }
+
+  static navigationTitles(toc: string): Map<string, string> {
+    const titles = new Map<string, string>();
+    const navPattern = /<a\b[^>]*href\s*=\s*(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
+    let navMatch: RegExpExecArray | null = navPattern.exec(toc);
+    while (navMatch !== null) {
+      const title = EpubParser.htmlToText(navMatch[3]);
+      if (title.length > 0) {
+        titles.set(navMatch[2], title);
+      }
+      navMatch = navPattern.exec(toc);
+    }
+
+    // EPUB 2 NCX stores the label before a self-closing content node.
+    const ncxPattern = /<navLabel\b[^>]*>[\s\S]*?<text\b[^>]*>([\s\S]*?)<\/text>[\s\S]*?<\/navLabel>[\s\S]*?<content\b[^>]*src\s*=\s*(["'])(.*?)\2[^>]*\/?\s*>/gi;
+    let ncxMatch: RegExpExecArray | null = ncxPattern.exec(toc);
+    while (ncxMatch !== null) {
+      const title = EpubParser.htmlToText(ncxMatch[1]);
+      if (title.length > 0) {
+        titles.set(ncxMatch[3], title);
+      }
+      ncxMatch = ncxPattern.exec(toc);
+    }
     return titles;
   }
 
@@ -151,7 +169,9 @@ export class EpubParser {
   }
 
   private static htmlToText(html: string): string {
-    return EpubParser.decodeEntities(html
+    const bodyMatch = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(html);
+    const content = bodyMatch === null ? html : bodyMatch[1];
+    return EpubParser.decodeEntities(content
       .replace(/<script\b[\s\S]*?<\/script>/gi, '')
       .replace(/<style\b[\s\S]*?<\/style>/gi, '')
       .replace(/<br\s*\/?>/gi, '\n')
@@ -163,6 +183,14 @@ export class EpubParser {
       .trim();
   }
 
+  private static removeLeadingTitle(content: string, title: string): string {
+    if (title.length === 0 || !content.startsWith(title) || content.length <= title.length) {
+      return content;
+    }
+    const remaining = content.substring(title.length);
+    return remaining.startsWith('\n') ? remaining.trim() : content;
+  }
+
   private static decodeEntities(text: string): string {
     return text.replace(/&nbsp;/gi, ' ')
       .replace(/&amp;/gi, '&')
@@ -170,13 +198,28 @@ export class EpubParser {
       .replace(/&gt;/gi, '>')
       .replace(/&quot;/gi, '"')
       .replace(/&#39;|&apos;/gi, "'")
-      .replace(/&#(\d+);/g, (whole: string, digits: string) => String.fromCharCode(Number(digits)));
+      .replace(/&#x([0-9a-f]+);/gi, (whole: string, digits: string) =>
+        EpubParser.characterForCodePoint(parseInt(digits, 16)))
+      .replace(/&#(\d+);/g, (whole: string, digits: string) =>
+        EpubParser.characterForCodePoint(Number(digits)));
+  }
+
+  private static characterForCodePoint(value: number): string {
+    if (value <= 0xFFFF) {
+      return String.fromCharCode(value);
+    }
+    const adjusted = value - 0x10000;
+    return String.fromCharCode(0xD800 + (adjusted >> 10), 0xDC00 + (adjusted & 0x3FF));
   }
 
   private static normalizeHref(href: string): string {
     const hash = href.indexOf('#');
     const value = hash >= 0 ? href.substring(0, hash) : href;
-    return EpubParser.normalizePath(decodeURIComponent(value));
+    try {
+      return EpubParser.normalizePath(decodeURIComponent(value));
+    } catch (error) {
+      return EpubParser.normalizePath(value);
+    }
   }
 
   private static normalizePath(path: string): string {

@@ -17,6 +17,9 @@ export class TxtParser {
   static parse(text: string, fallbackTitle: string,
     splitMode: ChapterSplitMode = ChapterSplitMode.DEFAULT): ParsedBook {
     const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+    if (normalized.length === 0) {
+      throw new Error('TXT 文件内容为空');
+    }
     const parsed = new ParsedBook();
     parsed.title = TxtParser.stripExtension(fallbackTitle);
     parsed.author = '本地 TXT';
@@ -90,9 +93,14 @@ export class TxtParser {
       case ChapterSplitMode.CHINESE_VOLUME:
         return new RegExp(`^\\s*(第[${number}]+卷[^\\r\\n]*)\\s*$`, 'gm');
       case ChapterSplitMode.PROLOGUE:
-        return /^\s*((?:序章|序言|楔子|引子|正文|番外|后记)[^\r\n]*)\s*$/gm;
+        return /^\s*((?:(?:序章|序言|楔子|引子|正文|后记)(?:[ \t　:：-]+[^\r\n]+)?|番外[^\r\n]*))\s*$/gm;
       default:
-        return new RegExp(`^\\s*(第[${number}]+章[^\\r\\n]*)\\s*$`, 'gm');
+        // Automatic mode covers the chapter styles most commonly found in local novels.
+        // Explicit modes remain available when a book uses ambiguous numbered headings.
+        return new RegExp(
+          `^\\s*((?:第[${number}]+(?:章|节|卷|部)[^\\r\\n]*|` +
+          `(?:chapter|chap\\.?|ch\\.?)[\\s.]*\\d+[^\\r\\n]*|` +
+          `(?:(?:序章|序言|楔子|引子|正文|后记)(?:[ \\t　:：-]+[^\\r\\n]+)?|番外[^\\r\\n]*)))\\s*$`, 'gim');
     }
   }
 

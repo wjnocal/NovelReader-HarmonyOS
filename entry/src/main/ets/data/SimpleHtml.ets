@@ -367,14 +367,22 @@ export class SimpleHtml {
 
   private static decodeEntities(value: string): string {
     const named = new Map<string, string>([
-      ['nbsp', ' '], ['amp', '&'], ['lt', '<'], ['gt', '>'], ['quot', '"'], ['apos', "'"], ['ldquo', '“'], ['rdquo', '”']
+      ['nbsp', ' '], ['amp', '&'], ['lt', '<'], ['gt', '>'], ['quot', '"'], ['apos', "'"],
+      ['ldquo', '“'], ['rdquo', '”'], ['lsquo', '‘'], ['rsquo', '’'], ['hellip', '…'], ['mdash', '—']
     ]);
     return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_full: string, entity: string): string => {
+      let codePoint = -1;
       if (entity.startsWith('#x') || entity.startsWith('#X')) {
-        return String.fromCharCode(parseInt(entity.substring(2), 16));
+        codePoint = parseInt(entity.substring(2), 16);
+      } else if (entity.startsWith('#')) {
+        codePoint = parseInt(entity.substring(1), 10);
       }
-      if (entity.startsWith('#')) {
-        return String.fromCharCode(parseInt(entity.substring(1), 10));
+      if (codePoint >= 0 && codePoint <= 0x10FFFF) {
+        if (codePoint <= 0xFFFF) {
+          return String.fromCharCode(codePoint);
+        }
+        const adjusted = codePoint - 0x10000;
+        return String.fromCharCode(0xD800 + (adjusted >> 10), 0xDC00 + (adjusted & 0x3FF));
       }
       return named.get(entity.toLowerCase()) ?? _full;
     });

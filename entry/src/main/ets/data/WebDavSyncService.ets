@@ -195,6 +195,15 @@ class WebDavClient {
     if (response.code === 404) {
       return '';
     }
+    if (response.code === 405) {
+      const property = await this.request('PROPFIND', path, new Uint8Array(0), '0');
+      if (property.code !== 207 && !this.success(property.code)) {
+        return '';
+      }
+      const xml = util.TextDecoder.create('utf-8').decodeToString(property.data);
+      const match = xml.match(/<(?:[a-z0-9_-]+:)?getetag[^>]*>([^<]+)<\/(?:[a-z0-9_-]+:)?getetag>/i);
+      return match === null ? '' : match[1].replace(/&quot;/g, '"').trim();
+    }
     const jsonMatch = response.headers.match(/"etag"\s*:\s*"((?:\\.|[^"])*)"/i);
     if (jsonMatch !== null) {
       return jsonMatch[1].replace(/\\"/g, '"');
@@ -215,22 +224,34 @@ class WebDavClient {
   }
 
   async putAtomic(path: string, bytes: Uint8Array, ifMatch: string = ''): Promise<void> {
+    if (ifMatch.length > 0) {
+      const conditional = await this.request('PUT', path, bytes, '', '', ifMatch);
+      if (conditional.code === 412) {
+        throw new Error('服务器数据已被另一台设备更新，请重试');
+      }
+      if (!this.success(conditional.code)) {
+        throw new Error(this.errorMessage('发布同步数据失败', conditional.code));
+      }
+      return;
+    }
     const temporary = `${path}.cache-${WebDavSyncService.uuid()}`;
     const staged = await this.request('PUT', temporary, bytes);
     if (!this.success(staged.code)) {
       throw new Error(this.errorMessage('上传同步数据失败', staged.code));
     }
     const destination = this.urlFor(path);
-    const moved = await this.request('MOVE', temporary, new Uint8Array(0), '', destination, ifMatch);
-    if (moved.code === 412) {
-      throw new Error('服务器数据已被另一台设备更新，请重试');
-    }
+    const moved = await this.request('MOVE', temporary, new Uint8Array(0), '', destination);
     if (this.success(moved.code)) {
       return;
     }
-    const direct = await this.request('PUT', path, bytes, '', '', ifMatch);
+    const direct = await this.request('PUT', path, bytes);
     if (!this.success(direct.code)) {
       throw new Error(this.errorMessage('发布同步数据失败', direct.code));
+    }
+    try {
+      await this.request('DELETE', temporary);
+    } catch (error) {
+      // The destination is already published; stale cache cleanup is best effort.
     }
   }
 
@@ -346,6 +367,9 @@ export class WebDavSyncService {
     let remote = new SyncManifest();
     if (remoteBytes !== undefined && remoteBytes.length > 0) {
       remote = JSON.parse(util.TextDecoder.create('utf-8').decodeToString(remoteBytes)) as SyncManifest;
+      if (remote.schema !== 1) {
+        throw new Error(`不支持的 WebDAV 同步格式：${remote.schema}`);
+      }
       this.normalizeManifest(remote);
     }
     let snapshot = LibraryStore.load(this.context);
@@ -379,7 +403,7 @@ export class WebDavSyncService {
       snapshot.settings.themeMode = manifest.readerSettings.themeMode;
       snapshot.settings.firstLineIndent = manifest.readerSettings.firstLineIndentEm;
       snapshot.settings.pageMargin = manifest.readerSettings.pageMarginDp;
-      snapshot.settings.readMode = 1;
+      snapshot.settings.readMode = manifest.readerSettings.readMode === 0 ? 0 : 1;
       snapshot.settingsUpdatedAt = manifest.readerSettings.updatedAt;
     }
     if (manifest.profile !== undefined && manifest.profile.nameUpdatedAt > snapshot.profileUpdatedAt) {
@@ -432,7 +456,7 @@ export class WebDavSyncService {
     manifest.readerSettings.textSizeSp = snapshot.settings.textSize;
     manifest.readerSettings.lineSpacingMultiplier = snapshot.settings.lineHeight;
     manifest.readerSettings.themeMode = snapshot.settings.themeMode;
-    manifest.readerSettings.readMode = previous.readerSettings.updatedAt > 0 ? previous.readerSettings.readMode : 1;
+    manifest.readerSettings.readMode = snapshot.settings.readMode === 0 ? 0 : 1;
     manifest.readerSettings.fontMode = previous.readerSettings.fontMode;
     manifest.readerSettings.paragraphSpacingDp = previous.readerSettings.paragraphSpacingDp;
     manifest.readerSettings.firstLineIndentEm = snapshot.settings.firstLineIndent;
@@ -555,6 +579,9 @@ export class WebDavSyncService {
 
   private mergeRemoteBookmarks(snapshot: LibrarySnapshot, items: Array<SyncBookmark>): void {
     items.forEach((remote: SyncBookmark): void => {
+      if (this.isDeleted(snapshot, 'bookmark', remote.syncId, remote.updatedAt)) {
+        return;
+      }
       const book = snapshot.books.find((item: BookRecord): boolean => item.syncId === remote.bookSyncId);
       if (book === undefined) {
         return;
@@ -571,6 +598,7 @@ export class WebDavSyncService {
       local.syncId = remote.syncId;
       local.bookId = book.id;
       local.chapterIndex = remote.chapterIndex;
+      local.pageIndex = remote.pageIndex;
       local.scrollOffset = remote.pageStartOffset;
       local.chapterTitle = remote.chapterTitle;
       local.summary = remote.summary;
@@ -595,8 +623,10 @@ export class WebDavSyncService {
     });
     snapshot.syncTombstones.forEach((item: SyncTombstoneRecord): void => {
       if (item.type === 'book') {
-        const removedIds = snapshot.books.filter((book: BookRecord): boolean => book.syncId === item.syncId)
-          .map((book: BookRecord): string => book.id);
+        const removedBooks = snapshot.books.filter((book: BookRecord): boolean => book.syncId === item.syncId &&
+          book.syncUpdatedAt <= item.deletedAt);
+        const removedIds = removedBooks.map((book: BookRecord): string => book.id);
+        removedBooks.forEach((book: BookRecord): void => LibraryStore.deleteBookFiles(this.context, book.id));
         snapshot.books = snapshot.books.filter((book: BookRecord): boolean => book.syncId !== item.syncId ||
           book.syncUpdatedAt > item.deletedAt);
         snapshot.bookmarks = snapshot.bookmarks.filter((bookmark: BookmarkRecord): boolean =>
@@ -608,6 +638,9 @@ export class WebDavSyncService {
       } else if (item.type === 'note') {
         snapshot.notes = snapshot.notes.filter((note: NoteRecord): boolean =>
           note.syncId !== item.syncId || note.updatedAt > item.deletedAt);
+      } else if (item.type === 'reading') {
+        snapshot.dailyReading = snapshot.dailyReading.filter((daily: DailyReadingRecord): boolean =>
+          daily.syncId !== item.syncId || daily.createdAt > item.deletedAt);
       }
     });
   }
@@ -637,6 +670,9 @@ export class WebDavSyncService {
 
   private mergeRemoteNotes(snapshot: LibrarySnapshot, items: Array<SyncNote>): void {
     items.forEach((remote: SyncNote): void => {
+      if (this.isDeleted(snapshot, 'note', remote.syncId, remote.updatedAt)) {
+        return;
+      }
       const book = snapshot.books.find((item: BookRecord): boolean => item.syncId === remote.bookSyncId);
       if (book === undefined) {
         return;
@@ -667,8 +703,9 @@ export class WebDavSyncService {
           const start = paragraphs[index].indexOf(remote.selectedText);
           if (start >= 0) {
             local.paragraphIndex = index;
-            local.textStartOffset = start;
-            local.textEndOffset = start + remote.selectedText.length;
+            // Let the reader derive canonical chapter offsets from the paragraph.
+            local.textStartOffset = -1;
+            local.textEndOffset = -1;
             break;
           }
         }
@@ -678,7 +715,12 @@ export class WebDavSyncService {
 
   private mergeRemoteReading(snapshot: LibrarySnapshot, events: Array<SyncReadingEvent>): void {
     events.forEach((event: SyncReadingEvent): void => {
-      if (snapshot.dailyReading.some((item: DailyReadingRecord): boolean => item.syncId === event.syncId)) {
+      if (this.isDeleted(snapshot, 'reading', event.syncId, event.createdAt)) {
+        return;
+      }
+      const synchronized = snapshot.dailyReading.find((item: DailyReadingRecord): boolean => item.syncId === event.syncId);
+      if (synchronized !== undefined) {
+        synchronized.readingMillis = Math.max(synchronized.readingMillis, event.readingMillis);
         return;
       }
       const existing = snapshot.dailyReading.find((item: DailyReadingRecord): boolean => item.date === event.date && item.syncId.length === 0);
@@ -787,6 +829,7 @@ export class WebDavSyncService {
     item.syncId = bookmark.syncId;
     item.bookSyncId = bookSyncId;
     item.chapterIndex = bookmark.chapterIndex;
+    item.pageIndex = bookmark.pageIndex;
     item.pageStartOffset = Math.floor(bookmark.scrollOffset);
     item.chapterTitle = bookmark.chapterTitle;
     item.summary = bookmark.summary;
