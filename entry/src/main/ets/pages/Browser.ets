@@ -101,12 +101,12 @@ struct Browser {
         Row() {
           Text(this.pageTitle)
             .fontSize(13)
-            .fontColor('#637169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .maxLines(1)
             .layoutWeight(1)
           Text('网页阅读 · 不保存浏览记录')
             .fontSize(11)
-            .fontColor('#8A948F')
+            .fontColor($r('app.color.ui_text_muted'))
         }
         .width('100%')
 
@@ -115,9 +115,9 @@ struct Browser {
             .width(42)
             .height(42)
             .fontSize(28)
-            .fontColor('#2E4338')
+            .fontColor($r('app.color.ui_text_primary'))
             .textAlign(TextAlign.Center)
-            .backgroundColor('#EDF2EE')
+            .backgroundColor($r('app.color.ui_surface_button'))
             .borderRadius(10)
             .onClick((): void => {
               if (this.safeCanGoBack()) {
@@ -130,9 +130,9 @@ struct Browser {
             .width(42)
             .height(42)
             .fontSize(28)
-            .fontColor(this.canGoForward ? '#2E4338' : '#A8B0AC')
+            .fontColor(this.canGoForward ? $r('app.color.ui_text_primary') : $r('app.color.ui_text_muted'))
             .textAlign(TextAlign.Center)
-            .backgroundColor('#EDF2EE')
+            .backgroundColor($r('app.color.ui_surface_button'))
             .borderRadius(10)
             .onClick((): void => {
               if (this.safeCanGoForward()) {
@@ -143,17 +143,20 @@ struct Browser {
             .width(48)
             .height(42)
             .fontSize(13)
-            .fontColor('#2E4338')
+            .fontColor($r('app.color.ui_text_primary'))
             .textAlign(TextAlign.Center)
-            .backgroundColor('#EDF2EE')
+            .backgroundColor($r('app.color.ui_surface_button'))
             .borderRadius(10)
             .onClick((): void => this.controller.refresh())
           TextInput({ text: this.address, placeholder: '输入网址或搜索小说' })
             .height(40)
             .layoutWeight(1)
             .fontSize(13)
-            .backgroundColor('#FFFFFF')
-            .border({ width: 1, color: '#DDE5DF' })
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface'))
+            .border({ width: 1, color: $r('app.color.ui_border') })
             .borderRadius(10)
             .enterKeyType(EnterKeyType.Go)
             .onChange((value: string): void => { this.address = value; })
@@ -162,9 +165,9 @@ struct Browser {
             .width(56)
             .height(42)
             .fontSize(13)
-            .fontColor('#FFFFFF')
+            .fontColor($r('app.color.ui_text_on_accent'))
             .textAlign(TextAlign.Center)
-            .backgroundColor('#476A58')
+            .backgroundColor($r('app.color.ui_browser_accent'))
             .borderRadius(10)
             .onClick((): void => this.loadAddress())
         }
@@ -172,7 +175,7 @@ struct Browser {
       }
       .width('100%')
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-      .backgroundColor('#F7FAF7')
+      .backgroundColor($r('app.color.ui_page_background'))
 
       if (this.progress > 0 && this.progress < 100) {
         Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
@@ -186,6 +189,8 @@ struct Browser {
           .width('100%')
           .height('100%')
           .javaScriptAccess(true)
+          .darkMode(WebDarkMode.Auto)
+          .forceDarkAccess(true)
           .domStorageAccess(true)
           .databaseAccess(true)
           .mixedMode(MixedMode.Compatible)
@@ -224,9 +229,9 @@ struct Browser {
           .fontSize(14)
           .lineHeight(20)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
+          .fontColor($r('app.color.ui_text_on_accent'))
           .textAlign(TextAlign.Center)
-          .backgroundColor('#476A58')
+          .backgroundColor($r('app.color.ui_browser_accent'))
           .borderRadius(36)
           .shadow({ radius: 12, color: '#55000000', offsetY: 4 })
           .margin({ right: 18, bottom: 22 })
@@ -237,7 +242,7 @@ struct Browser {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#F7FAF7')
+    .backgroundColor($r('app.color.ui_page_background'))
     .safeAreaPadding({ top: 8, bottom: 8 })
   }
 }

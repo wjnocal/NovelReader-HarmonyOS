@@ -466,6 +466,7 @@ export class WebDavSyncService {
     manifest.folders = previous.folders;
     for (let index = 0; index < snapshot.books.length; index++) {
       const book = snapshot.books[index];
+      if (book.downloadComplete === false) continue;
       if (book.syncContentHash.length === 0 || !(await client.exists(`${SYNC_ROOT}objects/${book.syncContentHash}.zip`))) {
         const archive = await this.createArchive(book);
         if (!(await client.exists(`${SYNC_ROOT}objects/${archive.sha256}.zip`))) {
@@ -480,13 +481,13 @@ export class WebDavSyncService {
     }
     snapshot.bookmarks.forEach((bookmark: BookmarkRecord): void => {
       const book = snapshot.books.find((item: BookRecord): boolean => item.id === bookmark.bookId);
-      if (book !== undefined) {
+      if (book !== undefined && book.downloadComplete !== false) {
         manifest.bookmarks.push(this.bookmarkToSync(bookmark, book.syncId));
       }
     });
     snapshot.notes.forEach((note: NoteRecord): void => {
       const book = snapshot.books.find((item: BookRecord): boolean => item.id === note.bookId);
-      if (book !== undefined) {
+      if (book !== undefined && book.downloadComplete !== false) {
         manifest.notes.push(this.noteToSync(note, book));
       }
     });

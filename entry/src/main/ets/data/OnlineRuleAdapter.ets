@@ -84,6 +84,25 @@ export class OnlineRuleAdapter {
     return SimpleHtml.parse(transformed, content.baseUrl).text();
   }
 
+  static prepareChapterContent(content: HtmlNode, rule: string): void {
+    if (rule.indexOf('base64.decode') < 0) return;
+    SimpleHtml.select(content, 'script').forEach((script: HtmlNode): void => {
+      const pattern = /document\.writeln\(qsbs\.bb\(['"]([^'"]+)['"]\)\);?/gi;
+      let replacement = '';
+      let match = pattern.exec(script.textValue);
+      while (match !== null) {
+        replacement += OnlineRuleAdapter.decodeBase64Utf8(match[1]);
+        match = pattern.exec(script.textValue);
+      }
+      if (replacement.length === 0 || script.parent === undefined) return;
+      const parent = script.parent;
+      const index = parent.children.indexOf(script);
+      const wrapper = SimpleHtml.parse(`<div>${replacement}</div>`, script.baseUrl).children[0];
+      wrapper.parent = parent;
+      parent.children.splice(index, 1, wrapper);
+    });
+  }
+
   static applyTocTransform(document: HtmlNode, sourceId: string): void {
     if (sourceId !== 'wxsy') {
       return;

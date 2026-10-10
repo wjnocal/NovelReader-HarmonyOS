@@ -111,6 +111,24 @@ export class SimpleHtml {
   }
 
   static select(scope: HtmlNode, rule: string): Array<HtmlNode> {
+    // The bundled rules contain these two XPath forms; retain their text/position semantics.
+    if (rule.startsWith('//div[@class=')) {
+      const classMatch = /@class=['"]([^'"]+)['"]/.exec(rule);
+      if (classMatch === null) return [];
+      const excluded = new Set<string>();
+      const pattern = /not\(text\(\)=['"]([^'"]+)['"]\)/g;
+      let match = pattern.exec(rule);
+      while (match !== null) {
+        excluded.add(match[1]);
+        match = pattern.exec(rule);
+      }
+      return SimpleHtml.select(scope, `div[class="${classMatch[1]}"] div a`)
+        .filter((node: HtmlNode): boolean => !excluded.has(node.text()));
+    }
+    if (rule.startsWith('//*[@id=')) {
+      const match = /^\/\/\*\[@id=['"]([^'"]+)['"]\]\/([a-z]+)\[(\d+)\]$/.exec(rule);
+      return match === null ? [] : SimpleHtml.select(scope, `#${match[1]} > ${match[2]}:nth-of-type(${match[3]})`);
+    }
     const output = new Array<HtmlNode>();
     SimpleHtml.splitOutside(rule, ',').forEach((group: string): void => {
       const steps = SimpleHtml.selectorSteps(group.trim());

@@ -3,6 +3,110 @@
     {
       "name": "start_window_background",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "ui_background",
+      "value": "#F7F4F1"
+    },
+    {
+      "name": "ui_page_background",
+      "value": "#F7FAF7"
+    },
+    {
+      "name": "ui_surface",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "ui_surface_overlay",
+      "value": "#F8FFFFFF"
+    },
+    {
+      "name": "ui_shelf_card",
+      "value": "#BFFFFFFF"
+    },
+    {
+      "name": "ui_shelf_input",
+      "value": "#EFFFFFFF"
+    },
+    {
+      "name": "ui_surface_subtle",
+      "value": "#F1F3EF"
+    },
+    {
+      "name": "ui_surface_button",
+      "value": "#EDF2EE"
+    },
+    {
+      "name": "ui_surface_success",
+      "value": "#F2F7F3"
+    },
+    {
+      "name": "ui_surface_error",
+      "value": "#F8ECE9"
+    },
+    {
+      "name": "ui_text_primary",
+      "value": "#111111"
+    },
+    {
+      "name": "ui_text_body",
+      "value": "#333333"
+    },
+    {
+      "name": "ui_text_secondary",
+      "value": "#687169"
+    },
+    {
+      "name": "ui_text_muted",
+      "value": "#8A948F"
+    },
+    {
+      "name": "ui_text_accent",
+      "value": "#496354"
+    },
+    {
+      "name": "ui_text_error",
+      "value": "#B74434"
+    },
+    {
+      "name": "ui_accent",
+      "value": "#486555"
+    },
+    {
+      "name": "ui_browser_accent",
+      "value": "#476A58"
+    },
+    {
+      "name": "ui_brand",
+      "value": "#B95A52"
+    },
+    {
+      "name": "ui_brand_background",
+      "value": "#DDB95A52"
+    },
+    {
+      "name": "ui_border",
+      "value": "#DDE5DF"
+    },
+    {
+      "name": "ui_text_on_accent",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "ui_reader_controls",
+      "value": "#E61E1A19"
+    },
+    {
+      "name": "ui_reader_controls_text",
+      "value": "#F0ECE6"
+    },
+    {
+      "name": "ui_reader_controls_secondary",
+      "value": "#B8B3AD"
+    },
+    {
+      "name": "ui_selection_surface",
+      "value": "#F02E2E2E"
     }
   ]
 }

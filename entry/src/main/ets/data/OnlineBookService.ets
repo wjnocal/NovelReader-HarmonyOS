@@ -7,6 +7,8 @@ import { ErrorText } from './ErrorText';
 import { LibraryStore } from './LibraryStore';
 import { OnlineRuleAdapter } from './OnlineRuleAdapter';
 import { OnlineBookExporter } from './OnlineBookExporter';
+import { OnlineChapterCache } from './OnlineChapterCache';
+import { OnlineChapterPublisher, OnlineDownloadState } from './OnlineDownloadState';
 import { HtmlNode, SimpleHtml } from './SimpleHtml';
 
 class SourceSearchData {
@@ -31,6 +33,8 @@ class SourceSearchRule {
   status: string = '';
   nextPage: string = '';
   disabled: boolean = false;
+  cookies: string = '';
+  minIntervalMillis: number = 0;
 }
 
 class SourceBookRule {
@@ -87,17 +91,51 @@ class ChapterReference {
 }
 
 export type OnlineProgress = (message: string, completed?: number, total?: number) => void;
+export type OnlineSearchResults = (results: Array<OnlineBookResult>) => void;
+
+export class OnlineSearchOptions {
+  requestTimeoutMillis: number = 8000;
+  sourceTimeoutMillis: number = 20000;
+  totalTimeoutMillis: number = 60000;
+}
+
+export class OnlineHttpError extends Error {
+  retryable: boolean;
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.retryable = retryable;
+  }
+}
 
 export class OnlineDownloadCancelToken {
   cancelled: boolean = false;
+  reason: string;
+  private callbacks: Set<() => void> = new Set<() => void>();
 
-  cancel(): void {
+  constructor(reason: string = '下载已取消') {
+    this.reason = reason;
+  }
+
+  cancel(reason: string = ''): void {
+    if (this.cancelled) return;
+    if (reason.length > 0) this.reason = reason;
     this.cancelled = true;
+    this.callbacks.forEach((callback: () => void): void => callback());
+    this.callbacks.clear();
+  }
+
+  register(callback: () => void): void {
+    if (this.cancelled) callback();
+    else this.callbacks.add(callback);
+  }
+
+  unregister(callback: () => void): void {
+    this.callbacks.delete(callback);
   }
 
   throwIfCancelled(): void {
     if (this.cancelled) {
-      throw new Error('下载已取消');
+      throw new Error(this.reason);
     }
   }
 }
@@ -105,10 +143,13 @@ export class OnlineDownloadCancelToken {
 export class OnlineBookService {
   private context: common.UIAbilityContext;
   private sources: Array<OnlineSource> = new Array<OnlineSource>();
-  private nextRequestAt: Map<string, number> = new Map<string, number>();
+  private searchOptions: OnlineSearchOptions;
+  private static nextRequestAt: Map<string, number> = new Map<string, number>();
+  private static backoffUntil: Map<string, number> = new Map<string, number>();
 
-  constructor(context: common.UIAbilityContext) {
+  constructor(context: common.UIAbilityContext, searchOptions: OnlineSearchOptions = new OnlineSearchOptions()) {
     this.context = context;
+    this.searchOptions = searchOptions;
   }
 
   async getSources(): Promise<Array<OnlineSourceInfo>> {
@@ -145,15 +186,18 @@ export class OnlineBookService {
   }
 
   async searchSelected(keyword: string, sourceIds: Array<string>,
-    progress?: OnlineProgress): Promise<Array<OnlineBookResult>> {
+    progress?: OnlineProgress, cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken('搜索已取消'),
+    onResults?: OnlineSearchResults): Promise<Array<OnlineBookResult>> {
     await this.ensureSources();
     const selected = new Set<string>(sourceIds);
-    return this.searchInternal(keyword, selected, progress);
+    return this.searchInternal(keyword, selected, progress, cancelToken, onResults);
   }
 
-  async search(keyword: string, progress?: OnlineProgress): Promise<Array<OnlineBookResult>> {
+  async search(keyword: string, progress?: OnlineProgress,
+    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken('搜索已取消'),
+    onResults?: OnlineSearchResults): Promise<Array<OnlineBookResult>> {
     await this.ensureSources();
-    return this.searchInternal(keyword, undefined, progress);
+    return this.searchInternal(keyword, undefined, progress, cancelToken, onResults);
   }
 
   async resultForUrl(url: string, sourceIds: Array<string>): Promise<OnlineBookResult> {
@@ -173,45 +217,115 @@ export class OnlineBookService {
   }
 
   private async searchInternal(keyword: string, selected: Set<string> | undefined,
-    progress?: OnlineProgress): Promise<Array<OnlineBookResult>> {
+    progress: OnlineProgress | undefined, cancelToken: OnlineDownloadCancelToken,
+    onResults: OnlineSearchResults | undefined): Promise<Array<OnlineBookResult>> {
+    cancelToken.throwIfCancelled();
     const enabled = this.sources.filter((source: OnlineSource): boolean => source.enabled &&
       (selected === undefined || selected.has(source.id)) && !source.search.disabled &&
       source.search.url.length > 0 && source.search.result.length > 0);
-    const output = new Array<OnlineBookResult>();
     let failedSources = 0;
-    for (let index = 0; index < enabled.length; index++) {
-      const source = enabled[index];
-      if (progress !== undefined) {
-        progress(`正在搜索 ${source.name}（${index + 1}/${enabled.length}）`);
-      }
-      try {
-        const results = await this.searchSource(source, keyword);
-        results.forEach((item: OnlineBookResult): void => {
-          const duplicated = output.some((existing: OnlineBookResult): boolean => existing.url === item.url);
-          if (!duplicated) {
-            output.push(item);
-          }
-        });
-      } catch (error) {
-        failedSources++;
-        if (progress !== undefined) {
-          progress(`${source.name} 失败：${ErrorText.from(error as BusinessError)}`);
+    let completedSources = 0;
+    let timedOut = false;
+    const active = new Set<string>();
+    const failures = new Array<string>();
+    const bySource = new Array<Array<OnlineBookResult>>(enabled.length);
+    const session = new OnlineDownloadCancelToken('搜索已取消');
+    const abort = (): void => session.cancel(cancelToken.reason);
+    cancelToken.register(abort);
+    const timeout = setTimeout((): void => {
+      timedOut = true;
+      session.cancel('本轮搜索超时，已停止等待');
+    }, Math.max(1, this.searchOptions.totalTimeoutMillis));
+    const report = (detail: string = ''): void => {
+      if (progress === undefined) return;
+      const searching = active.size > 0 ? `，正在搜索：${Array.from(active).join('、')}` : '';
+      const failure = detail.length > 0 ? `；${detail}` : '';
+      progress(`搜索进度 ${completedSources}/${enabled.length}${searching}${failure}`, completedSources, enabled.length);
+    };
+    const publish = (): void => {
+      if (onResults !== undefined) onResults(this.mergeSearchResults(bySource));
+    };
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < enabled.length && !session.cancelled) {
+        const index = cursor++;
+        const source = enabled[index];
+        const sourceToken = new OnlineDownloadCancelToken('搜索已取消');
+        const abortSource = (): void => sourceToken.cancel(session.reason);
+        session.register(abortSource);
+        const sourceTimeout = setTimeout((): void => {
+          sourceToken.cancel('书源搜索超时，已跳过');
+        }, Math.max(1, this.searchOptions.sourceTimeoutMillis));
+        active.add(source.name);
+        report();
+        let detail = '';
+        try {
+          bySource[index] = await this.searchSource(source, keyword, sourceToken,
+            (results: Array<OnlineBookResult>): void => {
+              if (session.cancelled) return;
+              bySource[index] = results;
+              publish();
+              report(`${source.name} 已找到 ${results.length} 个结果`);
+            });
+        } catch (error) {
+          failedSources++;
+          detail = `${source.name} 已跳过：${ErrorText.from(error as BusinessError)}`;
+          failures.push(detail);
+        } finally {
+          clearTimeout(sourceTimeout);
+          session.unregister(abortSource);
+          active.delete(source.name);
+          completedSources++;
+          publish();
+          report(detail);
         }
       }
+    };
+    try {
+      const workers = new Array<Promise<void>>();
+      for (let index = 0; index < Math.min(4, enabled.length); index++) workers.push(worker());
+      await Promise.all(workers);
+    } finally {
+      clearTimeout(timeout);
+      cancelToken.unregister(abort);
+    }
+    cancelToken.throwIfCancelled();
+    const output = this.mergeSearchResults(bySource);
+    const failed = failures.length > 0 ? `；${failures.join('；')}` : '';
+    const deadline = timedOut ? '搜索达到时间上限，保留已找到的结果' : '搜索完成';
+    if (progress !== undefined) {
+      progress(`${deadline}：${completedSources}/${enabled.length} 个书源已结束，找到 ${output.length} 个结果${failed}`,
+        completedSources, enabled.length);
     }
     if (output.length === 0 && enabled.length > 0) {
+      if (timedOut) throw new Error(`搜索超时，未找到结果，请减少所选书源或稍后重试${failed}`);
       if (failedSources === enabled.length) {
-        throw new Error(`全部 ${enabled.length} 个书源连接失败，请检查网络后重试`);
+        throw new Error(`全部 ${enabled.length} 个书源搜索失败${failed}`);
       }
       const connected = enabled.length - failedSources;
-      const suffix = failedSources > 0 ? `，另有 ${failedSources} 个书源连接失败` : '';
-      throw new Error(`已连接 ${connected} 个书源，但没有解析到匹配结果${suffix}；书源页面可能已改版`);
+      throw new Error(`已连接 ${connected} 个书源，但没有解析到匹配结果；书源页面可能已改版${failed}`);
     }
     return output;
   }
 
+  private mergeSearchResults(bySource: Array<Array<OnlineBookResult>>): Array<OnlineBookResult> {
+    const output = new Array<OnlineBookResult>();
+    const seen = new Set<string>();
+    bySource.forEach((results: Array<OnlineBookResult>): void => {
+      results?.forEach((item: OnlineBookResult): void => {
+        const key = `${item.sourceId}|${item.url}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          output.push(item);
+        }
+      });
+    });
+    return output;
+  }
+
   async downloadToLibrary(result: OnlineBookResult, format: string = 'txt', progress?: OnlineProgress,
-    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken()): Promise<BookRecord> {
+    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken(),
+    onReadable?: (book: BookRecord) => void): Promise<BookRecord> {
     await this.ensureSources();
     const source = this.sources.find((item: OnlineSource): boolean => item.id === result.sourceId);
     if (source === undefined) {
@@ -219,7 +333,7 @@ export class OnlineBookService {
     }
     cancelToken.throwIfCancelled();
     progress?.('正在读取书籍信息', 0, 0);
-    const bookDocument = await this.requestDocument(result.url, source);
+    const bookDocument = await this.requestDocument(result.url, source, '', false, cancelToken);
     const resultTitle = result.bookName === '网址下载' ? this.genericBookTitle(bookDocument) : result.bookName;
     const title = this.fallback(this.selectValue(bookDocument, source.book.bookName, true), resultTitle);
     const resultAuthor = result.author.length > 0 ? result.author : this.genericBookAuthor(bookDocument);
@@ -227,16 +341,18 @@ export class OnlineBookService {
     const category = this.fallback(this.selectValue(bookDocument, source.book.category, true), result.category);
     const description = this.selectValue(bookDocument, source.book.intro, true);
     progress?.('正在读取章节目录', 0, 0);
-    const references = await this.parseToc(source, result.url);
+    const references = await this.parseToc(source, result.url, bookDocument, cancelToken);
     if (references.length === 0) {
       throw new Error('书源没有返回章节目录');
     }
 
-    const chapters = await this.downloadChapters(source, references, progress, cancelToken);
-    cancelToken.throwIfCancelled();
-    progress?.(`正在生成 ${format.toUpperCase()} 文件`, chapters.length, chapters.length);
+    const normalizedFormat = format.toLowerCase() === 'epub' ? 'epub' : 'txt';
+    const identity = JSON.stringify([source.id, result.url, normalizedFormat, source.chapter,
+      references.map((reference: ChapterReference): string => `${reference.url}|${reference.title}`)]);
+    const downloadKey = OnlineDownloadState.key(identity);
     const snapshot = LibraryStore.load(this.context);
-    const existing = snapshot.books.find((book: BookRecord): boolean =>
+    const existing = snapshot.books.find((book: BookRecord): boolean => book.downloadKey === downloadKey) ??
+      snapshot.books.find((book: BookRecord): boolean =>
       book.title.trim().toLowerCase() === title.trim().toLowerCase() &&
       book.author.trim().toLowerCase() === author.trim().toLowerCase());
     const now = Date.now();
@@ -244,32 +360,85 @@ export class OnlineBookService {
     const directory = LibraryStore.bookDirectory(this.context, id);
     const chapterPath = existing === undefined || existing.chapterFilePath.length === 0 ?
       `${directory}/chapters.json` : existing.chapterFilePath;
-    LibraryStore.saveChapters(chapterPath, chapters);
-    const originalPath = await OnlineBookExporter.write(directory, title, author, description, chapters, format);
     const book = existing === undefined ? new BookRecord() : existing;
     book.id = id;
+    if (book.syncId.length === 0) book.syncId = `online-${id}`;
     book.title = title.length > 0 ? title : result.bookName;
     book.author = author.length > 0 ? author : '未知作者';
     book.category = category.length > 0 ? category : '网络小说';
     book.description = description;
-    book.fileType = format.toLowerCase() === 'epub' ? 'epub' : 'txt';
-    book.originalFilePath = originalPath;
+    book.fileType = normalizedFormat;
     book.chapterFilePath = chapterPath;
-    book.totalChapters = chapters.length;
-    book.currentChapterIndex = Math.max(0, Math.min(book.currentChapterIndex, chapters.length - 1));
-    book.currentPageIndex = 0;
-    book.scrollOffset = 0;
+    book.totalChapters = references.length;
     book.createdAt = book.createdAt > 0 ? book.createdAt : now;
     book.updatedAt = now;
     book.syncUpdatedAt = now;
     book.syncContentHash = '';
-    if (existing === undefined) {
-      snapshot.books.push(book);
+    // Existing complete books stay intact until their replacement finishes.
+    const incremental = existing === undefined || !existing.downloadComplete;
+    if (existing !== undefined && !existing.downloadComplete && existing.downloadKey !== downloadKey) {
+      throw new Error('书源、下载格式、目录或解析规则已变化，请选择原书源与格式，或删除未完成书籍后重新下载');
     }
-    snapshot.books.sort((left: BookRecord, right: BookRecord): number => right.updatedAt - left.updatedAt);
-    LibraryStore.save(this.context, snapshot);
-    progress?.('下载完成，已加入书架', chapters.length, chapters.length);
-    return book;
+    const resumed = existing !== undefined && !existing.downloadComplete ? LibraryStore.loadChapters(existing) : [];
+    let lastPublished = 0;
+    let published = existing !== undefined;
+    const publish = (chapters: Array<ChapterRecord>, complete: boolean = false, originalPath: string = ''): BookRecord => {
+      const latest = LibraryStore.load(this.context);
+      let target = latest.books.find((item: BookRecord): boolean => item.id === id);
+      if (target === undefined && published) throw new Error('书籍已从书架移除，停止下载');
+      if (target === undefined) {
+        target = book;
+        latest.books.push(target);
+      }
+      LibraryStore.saveChapters(chapterPath, chapters);
+      target.chapterFilePath = chapterPath;
+      if (target.syncId.length === 0) target.syncId = `online-${id}`;
+      target.totalChapters = references.length;
+      target.availableChapters = chapters.length;
+      target.downloadKey = downloadKey;
+      target.downloadComplete = complete;
+      target.downloadRevision = (target.downloadRevision ?? 0) + 1;
+      target.fileType = normalizedFormat;
+      target.originalFilePath = originalPath;
+      target.syncContentHash = '';
+      target.syncUpdatedAt = Date.now();
+      target.currentChapterIndex = Math.min(target.currentChapterIndex, chapters.length - 1);
+      LibraryStore.save(this.context, latest);
+      published = true;
+      lastPublished = Date.now();
+      onReadable?.(target);
+      AppStorage.setOrCreate<number>('onlineLibraryRevision',
+        (AppStorage.get<number>('onlineLibraryRevision') ?? 0) + 1);
+      return target;
+    };
+    const cache = new OnlineChapterCache(this.context);
+    const publisher = new OnlineChapterPublisher();
+    resumed.forEach((chapter: ChapterRecord, index: number): void => {
+      publisher.complete(index, chapter);
+    });
+    if (resumed.length > 0) onReadable?.(book);
+    let chapters = new Array<ChapterRecord>();
+    try {
+      chapters = await this.downloadChapters(source, references, progress, cancelToken, cache, resumed,
+        (index: number, chapter: ChapterRecord): void => {
+          const appended = publisher.complete(index, chapter);
+          if (incremental && appended.length > 0 &&
+            (!published || Date.now() - lastPublished >= 750)) publish(publisher.readable());
+        });
+      cancelToken.throwIfCancelled();
+      progress?.(`正在生成 ${normalizedFormat.toUpperCase()} 文件`, chapters.length, chapters.length);
+      const originalPath = await OnlineBookExporter.write(directory, title, author, description, chapters, normalizedFormat);
+      cancelToken.throwIfCancelled();
+      const completedBook = publish(chapters, true, originalPath);
+      progress?.('下载完成，已加入书架', chapters.length, chapters.length);
+      return completedBook;
+    } catch (error) {
+      const readable = publisher.readable();
+      if (incremental && readable.length > 0) publish(readable);
+      throw new Error(String(error));
+    } finally {
+      try { cache.prune(); } catch (error) { /* Cache maintenance cannot invalidate a readable book. */ }
+    }
   }
 
   private async downloadLegacyToLibrary(result: OnlineBookResult, progress?: OnlineProgress): Promise<BookRecord> {
@@ -379,6 +548,8 @@ export class OnlineBookService {
     source.search.status = search.status ?? '';
     source.search.nextPage = search.nextPage ?? '';
     source.search.disabled = search.disabled ?? false;
+    source.search.cookies = search.cookies ?? '';
+    source.search.minIntervalMillis = search.minIntervalMillis ?? 0;
     const data = search.data ?? new SourceSearchData();
     source.search.data.name = data.name ?? '';
     source.search.data.s = data.s ?? '';
@@ -419,7 +590,8 @@ export class OnlineBookService {
     return source;
   }
 
-  private async searchSource(source: OnlineSource, keyword: string): Promise<Array<OnlineBookResult>> {
+  private async searchSource(source: OnlineSource, keyword: string, cancelToken: OnlineDownloadCancelToken,
+    onResults: OnlineSearchResults): Promise<Array<OnlineBookResult>> {
     let url = OnlineRuleAdapter.buildSearchUrl(source.id, source.search.url, keyword);
     let body = '';
     if (source.search.method.toLowerCase() === 'post') {
@@ -433,24 +605,28 @@ export class OnlineBookService {
       body = values.join('&');
     }
     const output = new Array<OnlineBookResult>();
-    const pages = new Array<HtmlNode>();
-    pages.push(await this.requestDocument(url, source, body, true));
+    const pages = new Array<string>();
+    pages.push(url);
     const visited = new Set<string>();
     for (let pageIndex = 0; pageIndex < pages.length && pageIndex < 5; pageIndex++) {
-      const document = pages[pageIndex];
+      cancelToken.throwIfCancelled();
+      const currentUrl = pages[pageIndex];
+      visited.add(currentUrl);
+      const document = await this.requestDocument(currentUrl, source, pageIndex === 0 ? body : '', true, cancelToken);
       const rows = SimpleHtml.select(document, source.search.result);
       const countBeforePage = output.length;
       rows.forEach((row: HtmlNode): void => this.appendSearchResult(row, source, output));
       if (output.length === countBeforePage) {
         this.appendFallbackSearchResults(document, source, keyword, output);
       }
+      onResults(output.slice());
       if (source.search.nextPage.length > 0) {
         const nextNodes = SimpleHtml.select(document, source.search.nextPage);
         for (let nextIndex = 0; nextIndex < nextNodes.length; nextIndex++) {
           const nextUrl = this.nodeUrl(nextNodes[nextIndex]);
-          if (nextUrl.length > 0 && !visited.has(nextUrl)) {
-            visited.add(nextUrl);
-            pages.push(await this.requestDocument(nextUrl, source));
+          if (nextUrl.length > 0 && !visited.has(nextUrl) && pages.indexOf(nextUrl) < 0 &&
+            this.sameHost(url, nextUrl)) {
+            pages.push(nextUrl);
           }
         }
       }
@@ -527,7 +703,8 @@ export class OnlineBookService {
     return node.parent === undefined ? node : node.parent;
   }
 
-  private async parseToc(source: OnlineSource, bookUrl: string): Promise<Array<ChapterReference>> {
+  private async parseToc(source: OnlineSource, bookUrl: string, bookDocument?: HtmlNode,
+    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken()): Promise<Array<ChapterReference>> {
     let tocUrl = bookUrl;
     const pattern = source.book.url;
     const template = source.toc.url.length > 0 ? source.toc.url : source.toc.baseUri;
@@ -544,6 +721,7 @@ export class OnlineBookService {
     const references = new Array<ChapterReference>();
     const tocUrls = new Array<string>();
     const visited = new Set<string>();
+    const chapterUrls = new Set<string>();
     tocUrls.push(tocUrl);
     for (let pageIndex = 0; pageIndex < tocUrls.length && pageIndex < 20; pageIndex++) {
       const currentUrl = tocUrls[pageIndex];
@@ -551,13 +729,16 @@ export class OnlineBookService {
         continue;
       }
       visited.add(currentUrl);
-      const document = await this.requestDocument(currentUrl, source);
+      cancelToken.throwIfCancelled();
+      const document = currentUrl === bookUrl && bookDocument !== undefined ? bookDocument :
+        await this.requestDocument(currentUrl, source, '', false, cancelToken);
       OnlineRuleAdapter.applyTocTransform(document, source.id);
       const nodes = SimpleHtml.select(document, OnlineRuleAdapter.selector(source.toc.item));
       nodes.forEach((node: HtmlNode): void => {
         const title = node.text();
         const url = this.nodeUrl(node);
-        if (title.length > 0 && url.length > 0 && !references.some((item: ChapterReference): boolean => item.url === url)) {
+        if (title.length > 0 && url.length > 0 && !chapterUrls.has(url)) {
+          chapterUrls.add(url);
           const reference = new ChapterReference();
           reference.title = title;
           reference.url = url;
@@ -568,10 +749,14 @@ export class OnlineBookService {
         SimpleHtml.select(document, source.toc.nextPage).forEach((node: HtmlNode): void => {
           const nextUrl = this.nodeUrl(node);
           if (nextUrl.length > 0 && !visited.has(nextUrl) && tocUrls.indexOf(nextUrl) < 0) {
+            if (!this.sameHost(bookUrl, nextUrl)) return;
             tocUrls.push(nextUrl);
           }
         });
       }
+    }
+    if (tocUrls.some((url: string): boolean => !visited.has(url))) {
+      throw new Error('目录分页超过安全上限，未下载以免生成残缺书籍');
     }
     if (source.toc.isDesc) {
       references.reverse();
@@ -580,42 +765,65 @@ export class OnlineBookService {
   }
 
   private async downloadChapters(source: OnlineSource, references: Array<ChapterReference>, progress: OnlineProgress | undefined,
-    cancelToken: OnlineDownloadCancelToken): Promise<Array<ChapterRecord>> {
+    cancelToken: OnlineDownloadCancelToken, cache: OnlineChapterCache,
+    resumed: Array<ChapterRecord>, onChapter: (index: number, chapter: ChapterRecord) => void): Promise<Array<ChapterRecord>> {
     const contents = new Array<string>(references.length).fill('');
     const workerCount = Math.max(1, Math.min(source.crawl.concurrency, references.length));
     let cursor = 0;
     let completed = 0;
+    let failure: Error | undefined = undefined;
+    const workerToken = new OnlineDownloadCancelToken();
+    const abort = (): void => workerToken.cancel();
+    cancelToken.register(abort);
+    const knownChapters = new Set<string>(references.map((reference: ChapterReference): string => reference.url));
     const worker = async (): Promise<void> => {
       while (true) {
-        cancelToken.throwIfCancelled();
+        workerToken.throwIfCancelled();
         const index = cursor;
         cursor++;
         if (index >= references.length) {
           return;
         }
         const reference = references[index];
-        contents[index] = await this.downloadChapter(source, reference, cancelToken);
+        const identity = JSON.stringify([source.id, reference.url, reference.title, source.chapter,
+          references[index + 1]?.url ?? '']);
+        let content = index < resumed.length ? resumed[index].content : await cache.read(identity);
+        if (content.length === 0) {
+          content = await this.downloadChapter(source, reference, workerToken, knownChapters);
+          workerToken.throwIfCancelled();
+          await cache.write(identity, content);
+        }
+        workerToken.throwIfCancelled();
+        contents[index] = content;
+        onChapter(index, new ChapterRecord(reference.title, content));
         completed++;
         progress?.(`下载章节 ${completed}/${references.length} · ${reference.title}`, completed, references.length);
       }
     };
     const workers = new Array<Promise<void>>();
     for (let index = 0; index < workerCount; index++) {
-      workers.push(worker());
+      workers.push(worker().catch((error: Error): void => {
+        if (failure === undefined) failure = error;
+        workerToken.cancel();
+      }));
     }
     await Promise.all(workers);
+    cancelToken.unregister(abort);
+    cancelToken.throwIfCancelled();
+    if (failure !== undefined) throw new Error(String(failure));
     return references.map((reference: ChapterReference, index: number): ChapterRecord =>
       new ChapterRecord(reference.title, contents[index]));
   }
 
   private async downloadChapter(source: OnlineSource, reference: ChapterReference,
-    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken()): Promise<string> {
+    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken(),
+    knownChapters: Set<string> = new Set<string>()): Promise<string> {
     let lastError = '';
     for (let attempt = 0; attempt <= Math.max(0, source.crawl.maxRetries); attempt++) {
       try {
         cancelToken.throwIfCancelled();
         if (attempt > 0) {
-          await this.delay(Math.max(500, source.crawl.minIntervalMillis) * attempt);
+          await this.delay(Math.max(500, source.crawl.minIntervalMillis) * attempt, cancelToken);
         }
         const pages = new Array<string>();
         const visited = new Set<string>();
@@ -628,13 +836,14 @@ export class OnlineBookService {
             continue;
           }
           visited.add(pageUrl);
-          const document = await this.requestDocument(pageUrl, source);
+          const document = await this.requestDocument(pageUrl, source, '', false, cancelToken);
           const contentNodes = SimpleHtml.select(document, OnlineRuleAdapter.selector(source.chapter.content));
           if (contentNodes.length === 0) {
             throw new Error('正文为空');
           }
           const pageParts = new Array<string>();
           contentNodes.forEach((content: HtmlNode): void => {
+            OnlineRuleAdapter.prepareChapterContent(content, source.chapter.content);
             if (source.chapter.filterTag.length > 0) {
               SimpleHtml.select(content, source.chapter.filterTag).forEach((node: HtmlNode): void => node.remove());
             }
@@ -660,23 +869,27 @@ export class OnlineBookService {
             if (nextNodes.length > 0) {
               const label = nextNodes[0].text();
               const nextUrl = this.nodeUrl(nextNodes[0]);
-              if (this.isChapterPageLink(source, pageUrl, nextUrl, label, visited)) {
+              if (!knownChapters.has(nextUrl) && this.isChapterPageLink(source, pageUrl, nextUrl, label, visited)) {
                 pages.push(nextUrl);
               }
             }
-          } else if (source.chapter.nextPageInJs.length > 0) {
+          }
+          if (pages.length === pageIndex + 1 && source.chapter.nextPageInJs.length > 0) {
             const selector = source.chapter.nextPageInJs.split('@js:')[0];
             const scriptNodes = SimpleHtml.select(document, selector);
             if (scriptNodes.length > 0) {
               const match = scriptNodes[0].text().match(/nextpage\s*=\s*[\\]?['"]([^'"]+)['"]/i);
               if (match !== null) {
                 const nextUrl = SimpleHtml.resolveUrl(pageUrl, match[1]);
-                if (this.isChapterPageLink(source, pageUrl, nextUrl, '', visited)) {
+                if (!knownChapters.has(nextUrl) && this.isChapterPageLink(source, pageUrl, nextUrl, '', visited)) {
                   pages.push(nextUrl);
                 }
               }
             }
           }
+        }
+        if (pages.some((url: string): boolean => !visited.has(url))) {
+          throw new Error('章节分页超过安全上限，不缓存残缺正文');
         }
         const text = parts.join('\n\n');
         if (text.length === 0) {
@@ -684,6 +897,8 @@ export class OnlineBookService {
         }
         return text;
       } catch (error) {
+        cancelToken.throwIfCancelled();
+        if (error instanceof OnlineHttpError && !error.retryable) throw error as OnlineHttpError;
         lastError = String(error);
       }
     }
@@ -691,19 +906,25 @@ export class OnlineBookService {
   }
 
   private async requestDocument(url: string, source: OnlineSource, body: string = '',
-    preprocessSearch: boolean = false): Promise<HtmlNode> {
-    await this.waitForSource(source);
+    preprocessSearch: boolean = false,
+    cancelToken: OnlineDownloadCancelToken = new OnlineDownloadCancelToken()): Promise<HtmlNode> {
+    const retries = preprocessSearch ? Math.min(1, source.crawl.maxRetries) : source.crawl.maxRetries;
+    const timeoutMillis = Math.max(1, preprocessSearch ?
+      Math.min(source.crawl.timeoutMillis, this.searchOptions.requestTimeoutMillis) : source.crawl.timeoutMillis);
+    for (let attempt = 0; ; attempt++) {
+    await this.waitForSource(source, preprocessSearch, cancelToken);
     const request = http.createHttp();
     const options: http.HttpRequestOptions = {
       method: body.length > 0 ? http.RequestMethod.POST : http.RequestMethod.GET,
       expectDataType: http.HttpDataType.ARRAY_BUFFER,
-      connectTimeout: source.crawl.timeoutMillis,
-      readTimeout: source.crawl.timeoutMillis
+      connectTimeout: timeoutMillis,
+      readTimeout: timeoutMillis
     };
     if (body.length > 0) {
       options.header = {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36',
-        'Referer': source.baseUrl,
+        'Referer': source.baseUrl.replace(/\/+$/, ''),
+        'Cookie': preprocessSearch ? source.search.cookies : '',
         'Accept': 'text/html,application/xhtml+xml',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
       };
@@ -711,49 +932,137 @@ export class OnlineBookService {
     } else {
       options.header = {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36',
-        'Referer': source.baseUrl,
+        'Referer': source.baseUrl.replace(/\/+$/, ''),
+        'Cookie': preprocessSearch ? source.search.cookies : '',
         'Accept': 'text/html,application/xhtml+xml'
       };
     }
     try {
-      const response = await request.request(url, options);
+      const response = await this.requestResponse(request, url, options, timeoutMillis, cancelToken);
+      cancelToken.throwIfCancelled();
+      if (response.responseCode === 429 || response.responseCode === 408 || response.responseCode >= 500) {
+        const header = response.header as Record<string, string>;
+        const retryAfter = header['retry-after'] ?? header['Retry-After'] ?? '';
+        const seconds = Number(retryAfter);
+        const retryMillis = retryAfter.length === 0 ? 0 : Number.isFinite(seconds) ? seconds * 1000 :
+          Math.max(0, Date.parse(retryAfter) - Date.now());
+        OnlineBookService.backoffUntil.set(source.id, Date.now() +
+          Math.min(120000, Math.max(1000 * Math.pow(2, attempt), retryMillis || 0)));
+        throw new OnlineHttpError(`HTTP ${response.responseCode}`, true);
+      }
       if (response.responseCode < 200 || response.responseCode >= 400) {
-        throw new Error(`HTTP ${response.responseCode}`);
+        throw new OnlineHttpError(`HTTP ${response.responseCode}`, false);
       }
       const bytes = new Uint8Array(response.result as ArrayBuffer);
       let html = util.TextDecoder.create('utf-8').decodeToString(bytes);
-      if (this.replacementCount(html) * 200 > Math.max(1, html.length)) {
+      const headers = response.header as Record<string, string>;
+      const contentType = headers['content-type'] ?? headers['Content-Type'] ?? '';
+      const declared = /charset\s*=\s*["']?([a-z0-9_-]+)/i.exec(contentType) ??
+        /<meta[^>]+charset\s*=\s*["']?([a-z0-9_-]+)/i.exec(html);
+      let encoding = declared === null ? '' : declared[1].toLowerCase();
+      if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) encoding = 'utf-16le';
+      else if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) encoding = 'utf-16be';
+      if (encoding === 'gbk' || encoding === 'gb2312') encoding = 'gb18030';
+      if (encoding.length > 0 && encoding !== 'utf-8' && encoding !== 'utf8') {
+        try { html = util.TextDecoder.create(encoding).decodeToString(bytes); } catch (error) { /* Keep UTF-8 if unavailable. */ }
+      } else if (this.replacementCount(html) * 200 > Math.max(1, html.length)) {
         try {
           html = util.TextDecoder.create('gb18030').decodeToString(bytes);
         } catch (error) {
           // Keep UTF-8 output if the platform image does not provide the legacy decoder.
         }
       }
+      html = html.replace(/^\uFEFF/, '');
       if (preprocessSearch) {
         html = OnlineRuleAdapter.preprocessSearchHtml(source.id, html);
       }
+      if (/(访问过于频繁|请求过于频繁|操作过于频繁|访问频率过高|too many requests|rate limit exceeded)/i.test(html)) {
+        OnlineBookService.backoffUntil.set(source.id, Date.now() + 2000 * Math.pow(2, attempt));
+        throw new OnlineHttpError('站点限流，请稍后重试', true);
+      }
       return SimpleHtml.parse(html, url);
+    } catch (error) {
+      cancelToken.throwIfCancelled();
+      if (error instanceof OnlineHttpError && (!error.retryable || attempt >= retries)) {
+        throw error as OnlineHttpError;
+      }
+      if (attempt >= retries) throw new Error(String(error));
+      await this.delay(Math.min(15000, 500 * Math.pow(2, attempt)), cancelToken);
     } finally {
       request.destroy();
     }
-  }
-
-  private async waitForSource(source: OnlineSource): Promise<void> {
-    const minimum = Math.max(0, source.crawl.minIntervalMillis);
-    const maximum = Math.max(minimum, source.crawl.maxIntervalMillis);
-    const interval = minimum + Math.floor(Math.random() * (maximum - minimum + 1));
-    const now = Date.now();
-    const reservedAt = Math.max(now, this.nextRequestAt.get(source.id) ?? 0);
-    this.nextRequestAt.set(source.id, reservedAt + interval);
-    const remaining = reservedAt - now;
-    if (remaining > 0) {
-      await this.delay(remaining);
     }
   }
 
-  private async delay(milliseconds: number): Promise<void> {
-    await new Promise<void>((resolve: () => void): void => {
-      setTimeout(resolve, milliseconds);
+  private async requestResponse(request: http.HttpRequest, url: string, options: http.HttpRequestOptions,
+    timeoutMillis: number, token: OnlineDownloadCancelToken): Promise<http.HttpResponse> {
+    token.throwIfCancelled();
+    return new Promise<http.HttpResponse>((resolve: (response: http.HttpResponse) => void,
+      reject: (error: Error) => void): void => {
+      let settled = false;
+      let timer = 0;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        token.unregister(abort);
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+        try { request.destroy(); } catch (destroyError) { /* Promise is already settled. */ }
+      };
+      // Do not rely on destroy() to settle the platform request promise.
+      const abort = (): void => fail(new Error(token.reason));
+      timer = setTimeout((): void => fail(new Error('网络请求超时')), timeoutMillis);
+      token.register(abort);
+      if (settled) return;
+      try {
+        request.request(url, options).then((response: http.HttpResponse): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(response);
+        }, (error: BusinessError): void => fail(new Error(ErrorText.from(error))));
+      } catch (error) {
+        fail(new Error(ErrorText.from(error as BusinessError)));
+      }
+    });
+  }
+
+  private async waitForSource(source: OnlineSource, searching: boolean,
+    token: OnlineDownloadCancelToken): Promise<void> {
+    token.throwIfCancelled();
+    const minimum = Math.max(0, searching ? Math.max(source.search.minIntervalMillis,
+      source.crawl.minIntervalMillis) : source.crawl.minIntervalMillis);
+    const maximum = Math.max(minimum, source.crawl.maxIntervalMillis);
+    const interval = minimum + Math.floor(Math.random() * (maximum - minimum + 1));
+    const now = Date.now();
+    const key = `${source.id}:${searching ? 'search' : 'crawl'}`;
+    const reservedAt = Math.max(now, OnlineBookService.nextRequestAt.get(key) ?? 0,
+      OnlineBookService.backoffUntil.get(source.id) ?? 0);
+    OnlineBookService.nextRequestAt.set(key, reservedAt +
+      Math.ceil(interval / (searching ? 1 : source.crawl.concurrency)));
+    const remaining = reservedAt - now;
+    if (remaining > 0) {
+      await this.delay(remaining, token);
+    }
+    token.throwIfCancelled();
+    const additionalBackoff = (OnlineBookService.backoffUntil.get(source.id) ?? 0) - Date.now();
+    if (additionalBackoff > 0) await this.delay(additionalBackoff, token);
+  }
+
+  private async delay(milliseconds: number, token: OnlineDownloadCancelToken): Promise<void> {
+    token.throwIfCancelled();
+    await new Promise<void>((resolve: () => void, reject: (error: Error) => void): void => {
+      let timer = 0;
+      const abort = (): void => {
+        clearTimeout(timer);
+        token.unregister(abort);
+        reject(new Error(token.reason));
+      };
+      timer = setTimeout((): void => { token.unregister(abort); resolve(); }, milliseconds);
+      token.register(abort);
     });
   }
 
@@ -838,7 +1147,7 @@ export class OnlineBookService {
   }
 
   private genericBookTitle(document: HtmlNode): string {
-    const selectors = ['meta[property="og:title"]', 'meta[name="og:novel:book_name"]',
+    const selectors = ['meta[property="og:novel:book_name"]', 'meta[name="og:novel:book_name"]', 'meta[property="og:title"]',
       'meta[name="book_name"]', 'h1'];
     for (let index = 0; index < selectors.length; index++) {
       const value = this.selectValue(document, selectors[index], true);

@@ -1,6 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { BookRecord, ChapterRecord, DailyReadingRecord, LibrarySnapshot, NoteRecord, ReaderSettings } from '../model/Models';
+import { OnlineDownloadState } from './OnlineDownloadState';
 
 const LIBRARY_FILE = 'library.json';
 
@@ -20,6 +21,18 @@ export class LibraryStore {
   static save(context: common.UIAbilityContext, snapshot: LibrarySnapshot): void {
     const root = LibraryStore.rootDir(context);
     LibraryStore.ensureDirectory(root);
+    const current = LibraryStore.readSnapshot(`${root}/${LIBRARY_FILE}`);
+    current?.books.forEach((stored: BookRecord): void => {
+      const book = snapshot.books.find((item: BookRecord): boolean => item.id === stored.id);
+      if (book !== undefined && (stored.downloadRevision ?? 0) > (book.downloadRevision ?? 0)) {
+        OnlineDownloadState.applyMetadata(book, stored);
+      }
+    });
+    // A screen opened before the first chapter arrived must not erase the new book on save.
+    current?.books.filter((stored: BookRecord): boolean => stored.downloadKey?.length > 0 &&
+      !snapshot.books.some((item: BookRecord): boolean => item.id === stored.id) &&
+      !snapshot.syncTombstones.some((item): boolean => item.type === 'book' && item.syncId === stored.syncId))
+      .forEach((stored: BookRecord): void => { snapshot.books.push(stored); });
     LibraryStore.writeAtomic(`${root}/${LIBRARY_FILE}`, JSON.stringify(snapshot), true);
   }
 
@@ -51,6 +64,10 @@ export class LibraryStore {
       if (book.syncId === undefined) book.syncId = '';
       if (book.syncContentHash === undefined) book.syncContentHash = '';
       if (book.syncUpdatedAt === undefined) book.syncUpdatedAt = 0;
+      if (book.downloadKey === undefined) book.downloadKey = '';
+      if (book.downloadComplete === undefined) book.downloadComplete = true;
+      if (book.availableChapters === undefined) book.availableChapters = book.totalChapters;
+      if (book.downloadRevision === undefined) book.downloadRevision = 0;
     });
     if (snapshot.bookmarks === undefined) snapshot.bookmarks = [];
     snapshot.bookmarks.forEach((bookmark): void => {
@@ -187,7 +204,7 @@ export class LibraryStore {
     }
   }
 
-  private static writeAtomic(path: string, content: string, keepBackup: boolean = false): void {
+  static writeAtomic(path: string, content: string, keepBackup: boolean = false): void {
     const temporary = `${path}.tmp`;
     LibraryStore.writeText(temporary, content);
     if (keepBackup) {

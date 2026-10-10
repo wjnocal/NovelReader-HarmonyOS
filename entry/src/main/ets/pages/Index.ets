@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { ErrorText } from '../data/ErrorText';
+import { AppTheme } from '../data/AppTheme';
 import { LibraryStore } from '../data/LibraryStore';
 import {
   BookRecord,
@@ -19,6 +20,8 @@ import {
 import { BookImporter } from '../parser/BookImporter';
 import { BackupService } from '../data/BackupService';
 import { OnlineBookService } from '../data/OnlineBookService';
+import { OnlineDownloadManager } from '../data/OnlineDownloadManager';
+import { OnlineDownloadState } from '../data/OnlineDownloadState';
 import { WebDavSyncService } from '../data/WebDavSyncService';
 
 class ReaderTextSegment {
@@ -48,6 +51,7 @@ class ReaderTextRange {
 @Entry
 @Component
 struct Index {
+  @StorageLink('systemDarkMode') private systemDarkMode: boolean = false;
   @State private page: string = 'shelf';
   @State private snapshot: LibrarySnapshot = new LibrarySnapshot();
   @State private books: Array<BookRecord> = new Array<BookRecord>();
@@ -84,6 +88,9 @@ struct Index {
   @StorageLink('appInForeground') @Watch('onAppForegroundChanged') private appInForeground: boolean = true;
   @StorageLink('onlineDownloadStatus') @Watch('onOnlineDownloadStatusChanged')
   private backgroundDownloadStatus: string = 'idle';
+  @StorageLink('onlineLibraryRevision') @Watch('onDownloadedChaptersChanged')
+  private onlineLibraryRevision: number = 0;
+  @StorageLink('openLocalBookId') @Watch('onOpenLocalBookRequested') private requestedBookId: string = '';
   @State private readerPages: Array<string> = new Array<string>();
   @State private readerCurrentPageText: string = '';
   @State private readerPageParagraphStarts: Array<number> = new Array<number>();
@@ -142,11 +149,58 @@ struct Index {
 
   aboutToAppear(): void {
     this.reloadLibrary();
+    this.onOpenLocalBookRequested();
+  }
+
+  onPageShow(): void {
+    this.onDownloadedChaptersChanged();
+    this.onOpenLocalBookRequested();
+  }
+
+  private onOpenLocalBookRequested(): void {
+    const id = AppStorage.get<string>('openLocalBookId') ?? '';
+    if (id.length > 0) {
+      AppStorage.setOrCreate<string>('openLocalBookId', '');
+      if (this.page === 'reader' && id === this.currentBookId) return;
+      if (this.page === 'reader') this.persistProgress();
+      this.reloadLibrary();
+      const book = this.snapshot.books.find((item: BookRecord): boolean => item.id === id);
+      if (book !== undefined) this.openBook(book);
+    }
+  }
+
+  private onDownloadedChaptersChanged(): void {
+    const latest = LibraryStore.load(this.context());
+    if (this.page === 'reader') {
+      const stored = latest.books.find((book: BookRecord): boolean => book.id === this.currentBookId);
+      const current = this.currentBook();
+      if (stored !== undefined && current !== undefined) {
+        OnlineDownloadState.applyMetadata(current, stored);
+        if (stored.availableChapters > this.chapters.length) {
+          const available = LibraryStore.loadChapters(stored);
+          if (available.length > this.chapters.length) this.chapters = available;
+        }
+      }
+      return;
+    }
+    this.reloadLibrary();
+  }
+
+  private pendingChapters(): boolean {
+    const book = this.currentBook();
+    return book !== undefined && OnlineDownloadState.incomplete(book) && this.chapters.length < book.totalChapters;
+  }
+
+  private showPendingChapter(): void {
+    if (!this.pendingChapters()) return;
+    promptAction.showToast({ message: OnlineDownloadManager.shared().isDownloading(this.currentBookId) ?
+      '下一章还在下载，请稍候再翻页' : '后续章节尚未下载，请到在线搜书选择原书源和格式继续下载' });
+    this.onDownloadedChaptersChanged();
   }
 
   private onOnlineDownloadStatusChanged(): void {
     if (this.backgroundDownloadStatus === 'completed') {
-      this.reloadLibrary();
+      this.onDownloadedChaptersChanged();
     }
   }
 
@@ -340,9 +394,9 @@ struct Index {
       const service = new OnlineBookService(this.context());
       this.onlineResults = await service.search(keyword, (message: string): void => {
         this.onlineStatus = message;
+      }, undefined, (results: Array<OnlineBookResult>): void => {
+        this.onlineResults = results;
       });
-      this.onlineStatus = this.onlineResults.length === 0 ? '没有找到结果，可稍后重试或更换关键词' :
-        `找到 ${this.onlineResults.length} 个结果`;
     } catch (error) {
       this.onlineStatus = `搜索失败：${ErrorText.from(error as BusinessError)}`;
     } finally {
@@ -479,7 +533,7 @@ struct Index {
       primaryButton: { value: '取消', action: () => {} },
       secondaryButton: {
         value: '清除',
-        fontColor: '#B74434',
+        fontColor: $r('app.color.ui_text_error'),
         action: () => {
           this.snapshot.dailyReading.forEach((daily: DailyReadingRecord): void => {
             this.recordSyncDeletion('reading', daily.syncId);
@@ -1208,6 +1262,7 @@ struct Index {
     if (targetIndex >= targetPages.length && direction < 0) {
       targetChapter++;
       if (targetChapter >= this.chapters.length) {
+        this.showPendingChapter();
         return false;
       }
       targetPages = this.createPages(targetChapter, false);
@@ -1627,6 +1682,7 @@ struct Index {
   }
 
   private changeChapter(index: number): void {
+    if (index >= this.chapters.length) this.showPendingChapter();
     if (index < 0 || index >= this.chapters.length || index === this.chapterIndex) {
       return;
     }
@@ -1659,7 +1715,7 @@ struct Index {
       },
       secondaryButton: {
         value: '删除',
-        fontColor: '#C54232',
+        fontColor: $r('app.color.ui_text_error'),
         action: () => {
           this.recordSyncDeletion('book', book.syncId);
           this.snapshot.books = this.snapshot.books.filter((item: BookRecord) => item.id !== book.id);
@@ -1832,20 +1888,11 @@ struct Index {
   }
 
   private readerBackground(): string {
-    switch (this.readerThemeMode) {
-      case 1:
-        return '#E7E1CF';
-      case 2:
-        return '#DDE8DD';
-      case 3:
-        return '#1D211F';
-      default:
-        return '#F7F4ED';
-    }
+    return AppTheme.readerBackground(this.readerThemeMode, this.systemDarkMode);
   }
 
   private readerTextColor(): string {
-    return this.readerThemeMode === 3 ? '#D7D9D7' : '#282A27';
+    return AppTheme.readerTextColor(this.readerThemeMode, this.systemDarkMode);
   }
 
   @Builder
@@ -1855,7 +1902,7 @@ struct Index {
         .width('100%')
         .height('100%')
         .objectFit(ImageFit.Cover)
-        .opacity(this.backgroundOpacity)
+        .opacity(this.systemDarkMode ? 0 : this.backgroundOpacity)
 
       Column() {
         if (this.mainTab === 'shelf') {
@@ -1864,26 +1911,26 @@ struct Index {
               Text(`累计阅读${this.formatMinutes(this.totalReadingMillis())}`)
                 .fontSize(16)
                 .fontWeight(FontWeight.Medium)
-                .fontColor('#111111')
+                .fontColor($r('app.color.ui_text_primary'))
                 .layoutWeight(1)
               Text(`连续${this.readingStreak()}天`)
                 .fontSize(12)
                 .fontWeight(FontWeight.Bold)
-                .fontColor('#FFFFFF')
+                .fontColor($r('app.color.ui_text_on_accent'))
                 .textAlign(TextAlign.Center)
                 .width(72)
                 .height(30)
                 .borderRadius(15)
-                .backgroundColor('#DDB95A52')
+                .backgroundColor($r('app.color.ui_brand_background'))
               Text('◷')
                 .fontSize(25)
-                .fontColor('#111111')
+                .fontColor($r('app.color.ui_text_primary'))
                 .textAlign(TextAlign.Center)
                 .width(42)
                 .onClick(() => this.openUtility('history'))
               Text(this.searchVisible ? '×' : '⌕')
                 .fontSize(30)
-                .fontColor('#111111')
+                .fontColor($r('app.color.ui_text_primary'))
                 .textAlign(TextAlign.Center)
                 .width(48)
                 .onClick(() => {
@@ -1896,7 +1943,7 @@ struct Index {
                 })
               Text('···')
                 .fontSize(30)
-                .fontColor('#111111')
+                .fontColor($r('app.color.ui_text_primary'))
                 .textAlign(TextAlign.Center)
                 .width(48)
                 .onClick(() => this.toggleMoreMenu())
@@ -1908,7 +1955,10 @@ struct Index {
               TextInput({ text: this.searchQuery, placeholder: '搜索书名、作者、分类或简介' })
                 .height(44)
                 .fontSize(16)
-                .backgroundColor('#EFFFFFFF')
+                .fontColor($r('app.color.ui_text_primary'))
+                .placeholderColor($r('app.color.ui_text_muted'))
+                .caretColor($r('app.color.ui_text_accent'))
+                .backgroundColor($r('app.color.ui_shelf_input'))
                 .borderRadius(22)
                 .padding({ left: 18, right: 18 })
                 .margin({ bottom: 12 })
@@ -1921,11 +1971,11 @@ struct Index {
                   (this.categoryFilter !== '全部' ? '当前筛选下没有书籍' : '书架还是空的'))
                   .fontSize(20)
                   .fontWeight(FontWeight.Bold)
-                  .fontColor('#333333')
+                  .fontColor($r('app.color.ui_text_body'))
                 Button(this.searchQuery.length > 0 ? '清除搜索' :
                   (this.categoryFilter !== '全部' ? '查看全部书籍' : '本机导入'))
-                  .fontColor('#111111')
-                  .backgroundColor('#CFFFFFFF')
+                  .fontColor($r('app.color.ui_text_primary'))
+                  .backgroundColor($r('app.color.ui_shelf_card'))
                   .margin({ top: 18 })
                   .onClick(() => {
                     if (this.searchQuery.length > 0) {
@@ -1950,46 +2000,46 @@ struct Index {
                           Text(book.title.substring(0, Math.min(12, book.title.length)))
                             .fontSize(17)
                             .fontWeight(FontWeight.Bold)
-                            .fontColor('#111111')
+                            .fontColor($r('app.color.ui_text_primary'))
                             .textAlign(TextAlign.Center)
                             .maxLines(3)
                             .textOverflow({ overflow: TextOverflow.Ellipsis })
                           Text(`${book.author} · ${book.fileType.toUpperCase()}`)
                             .fontSize(12)
-                            .fontColor('#333333')
+                            .fontColor($r('app.color.ui_text_body'))
                             .maxLines(1)
                             .margin({ top: 14 })
                         }
                         .justifyContent(FlexAlign.Center)
                         .width('100%')
                         .height(142)
-                        .backgroundColor('#55FFFFFF')
+                        .backgroundColor($r('app.color.ui_surface_button'))
                         if (book.pinnedAt > 0) {
                           Text('◆')
                             .fontSize(20)
-                            .fontColor('#B95A52')
+                            .fontColor($r('app.color.ui_brand'))
                             .margin({ top: 4, right: 6 })
                         }
                       }
                       Text(book.title)
                         .fontSize(16)
                         .fontWeight(FontWeight.Bold)
-                        .fontColor('#111111')
+                        .fontColor($r('app.color.ui_text_primary'))
                         .maxLines(2)
                         .width('100%')
                         .margin({ top: 10 })
                       Text(`阅读进度 ${this.chapterProgress(book)}% · ${book.totalChapters}章`)
                         .fontSize(12)
-                        .fontColor('#333333')
+                        .fontColor($r('app.color.ui_text_body'))
                         .maxLines(1)
                         .width('100%')
                         .margin({ top: 4 })
                     }
                     .padding(8)
                     .width('100%')
-                    .backgroundColor('#BFFFFFFF')
+                    .backgroundColor($r('app.color.ui_shelf_card'))
                     .borderRadius(4)
-                    .border({ width: 1, color: '#80FFFFFF' })
+                    .border({ width: 1, color: $r('app.color.ui_border') })
                     .shadow({ radius: 7, color: '#33000000', offsetY: 3 })
                     .onClick(() => this.openBook(book))
                     .gesture(LongPressGesture().onAction(() => {
@@ -2012,28 +2062,28 @@ struct Index {
                         Text(book.title)
                           .fontSize(17)
                           .fontWeight(FontWeight.Bold)
-                          .fontColor('#111111')
+                          .fontColor($r('app.color.ui_text_primary'))
                           .maxLines(2)
                           .layoutWeight(1)
                         Text(book.pinnedAt > 0 ? '◆' : '')
-                          .fontColor('#B95A52')
+                          .fontColor($r('app.color.ui_brand'))
                       }
                       Text(`${book.author} · ${book.fileType.toUpperCase()} · ${book.totalChapters}章`)
                         .fontSize(14)
-                        .fontColor('#333333')
+                        .fontColor($r('app.color.ui_text_body'))
                         .width('100%')
                         .margin({ top: 6 })
                       Text(`阅读进度 ${this.chapterProgress(book)}%`)
                         .fontSize(12)
-                        .fontColor('#333333')
+                        .fontColor($r('app.color.ui_text_body'))
                         .width('100%')
                         .margin({ top: 10 })
                     }
                     .padding(16)
                     .width('100%')
-                    .backgroundColor('#BFFFFFFF')
+                    .backgroundColor($r('app.color.ui_shelf_card'))
                     .borderRadius(8)
-                    .border({ width: 1, color: '#80FFFFFF' })
+                    .border({ width: 1, color: $r('app.color.ui_border') })
                     .onClick(() => this.openBook(book))
                     .gesture(LongPressGesture().onAction(() => {
                       this.openBookActions(book);
@@ -2054,7 +2104,7 @@ struct Index {
           Text('书架')
             .fontSize(16)
             .fontWeight(this.mainTab === 'shelf' ? FontWeight.Bold : FontWeight.Normal)
-            .fontColor(this.mainTab === 'shelf' ? '#B95A52' : '#111111')
+            .fontColor(this.mainTab === 'shelf' ? $r('app.color.ui_brand') : $r('app.color.ui_text_primary'))
             .textAlign(TextAlign.Center)
             .layoutWeight(1)
             .height(52)
@@ -2062,7 +2112,7 @@ struct Index {
           Text('主页')
             .fontSize(16)
             .fontWeight(this.mainTab === 'home' ? FontWeight.Bold : FontWeight.Normal)
-            .fontColor(this.mainTab === 'home' ? '#B95A52' : '#111111')
+            .fontColor(this.mainTab === 'home' ? $r('app.color.ui_brand') : $r('app.color.ui_text_primary'))
             .textAlign(TextAlign.Center)
             .layoutWeight(1)
             .height(52)
@@ -2070,7 +2120,7 @@ struct Index {
         }
         .width('100%')
         .height(56)
-        .backgroundColor('#EFFFFFFF')
+        .backgroundColor($r('app.color.ui_shelf_input'))
         .borderRadius(28)
         .margin({ bottom: 10 })
         .shadow({ radius: 8, color: '#33000000', offsetY: 3 })
@@ -2086,7 +2136,7 @@ struct Index {
         Column() {
           Text(this.importing ? '导入中…' : '本机导入')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
@@ -2096,7 +2146,7 @@ struct Index {
             })
           Text(this.gridMode ? '切换列表视图' : '切换网格视图')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
@@ -2105,49 +2155,49 @@ struct Index {
             })
           Text('导入记录')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
             .onClick(() => this.openUtility('imports'))
           Text('书架排序')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
             .onClick(() => this.cycleSortMode())
           Text('分类筛选')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
             .onClick(() => this.openUtility('category'))
           Text('阅读统计')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
             .onClick(() => this.openUtility('stats'))
           Text('阅读目标')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
             .onClick(() => this.openUtility('goal'))
           Text('书架背景')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
             .onClick(() => this.openUtility('background'))
           Text('备份数据')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
@@ -2157,7 +2207,7 @@ struct Index {
             })
           Text('恢复数据')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
@@ -2167,7 +2217,7 @@ struct Index {
             })
           Text('在线搜书')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
@@ -2176,7 +2226,7 @@ struct Index {
             })
           Text('内置浏览器')
             .fontSize(16)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .height(52)
             .padding({ left: 18 })
@@ -2184,7 +2234,7 @@ struct Index {
         }
         .width(220)
         .padding({ top: 10, bottom: 10 })
-        .backgroundColor('#F8FFFFFF')
+        .backgroundColor($r('app.color.ui_surface_overlay'))
         .borderRadius(14)
         .shadow({ radius: 18, color: '#44000000', offsetY: 6 })
         .margin({ top: 76, right: 20 })
@@ -2199,7 +2249,7 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#F7F4F1')
+    .backgroundColor($r('app.color.ui_background'))
   }
 
   @Builder
@@ -2210,24 +2260,24 @@ struct Index {
           Text('主页')
             .fontSize(30)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#111111')
+            .fontColor($r('app.color.ui_text_primary'))
             .layoutWeight(1)
           Text(this.snapshot.userName.length > 0 ? this.snapshot.userName.substring(0, 1) : '默')
             .fontSize(22)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#FFFFFF')
+            .fontColor($r('app.color.ui_text_on_accent'))
             .textAlign(TextAlign.Center)
             .width(56)
             .height(56)
             .borderRadius(28)
-            .backgroundColor('#7D9185')
+            .backgroundColor($r('app.color.ui_accent'))
             .onClick(() => this.openUtility('profile'))
         }
         .width('100%')
         Text(`今日目标 ${Math.floor(this.todayReadingMillis() / 60000)}/${this.snapshot.readingGoalMinutes}分钟 · ${Math.min(100,
           Math.floor(this.todayReadingMillis() / Math.max(1, this.snapshot.readingGoalMinutes * 60000) * 100))}%`)
           .fontSize(16)
-          .fontColor('#111111')
+          .fontColor($r('app.color.ui_text_primary'))
           .width('100%')
           .margin({ top: 8 })
 
@@ -2238,7 +2288,7 @@ struct Index {
         }
         .width('100%')
         .padding(18)
-        .backgroundColor('#DFFFFFFF')
+        .backgroundColor($r('app.color.ui_shelf_card'))
         .borderRadius(18)
         .shadow({ radius: 8, color: '#26000000', offsetY: 3 })
         .margin({ top: 24 })
@@ -2246,7 +2296,7 @@ struct Index {
         Text('常用功能')
           .fontSize(18)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#111111')
+          .fontColor($r('app.color.ui_text_primary'))
           .width('100%')
           .margin({ top: 26, bottom: 6 })
         this.HomeAction('阅读统计', '查看近七天与累计阅读', () => this.openUtility('stats'))
@@ -2276,8 +2326,8 @@ struct Index {
   @Builder
   private HomeStat(value: string, label: string) {
     Column() {
-      Text(value).fontSize(21).fontWeight(FontWeight.Bold).fontColor('#111111')
-      Text(label).fontSize(13).fontColor('#333333').margin({ top: 4 })
+      Text(value).fontSize(21).fontWeight(FontWeight.Bold).fontColor($r('app.color.ui_text_primary'))
+      Text(label).fontSize(13).fontColor($r('app.color.ui_text_body')).margin({ top: 4 })
     }
     .layoutWeight(1)
   }
@@ -2286,17 +2336,17 @@ struct Index {
   private HomeAction(title: string, subtitle: string, action: () => void) {
     Row() {
       Column() {
-        Text(title).fontSize(16).fontWeight(FontWeight.Bold).fontColor('#111111')
-        Text(subtitle).fontSize(13).fontColor('#666666').margin({ top: 3 })
+        Text(title).fontSize(16).fontWeight(FontWeight.Bold).fontColor($r('app.color.ui_text_primary'))
+        Text(subtitle).fontSize(13).fontColor($r('app.color.ui_text_secondary')).margin({ top: 3 })
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
-      Text('›').fontSize(28).fontColor('#777777')
+      Text('›').fontSize(28).fontColor($r('app.color.ui_text_muted'))
     }
     .width('100%')
     .height(64)
     .padding({ left: 18, right: 18 })
-    .backgroundColor('#DFFFFFFF')
+    .backgroundColor($r('app.color.ui_shelf_card'))
     .borderRadius(14)
     .margin({ top: 10 })
     .onClick(action)
@@ -2322,11 +2372,11 @@ struct Index {
                   this.utilityPage === 'profile' ? '个人与设置' : '书籍管理')
             .fontSize(22)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#1E211F')
+            .fontColor($r('app.color.ui_text_primary'))
             .layoutWeight(1)
           Text('×')
             .fontSize(28)
-            .fontColor('#68706A')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width(44)
             .textAlign(TextAlign.Center)
             .onClick(() => this.closeUtility())
@@ -2344,7 +2394,7 @@ struct Index {
           Text('最近 7 天')
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#303632')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .margin({ top: 26, bottom: 10 })
           Row() {
@@ -2352,16 +2402,16 @@ struct Index {
               Column() {
                 Text(`${Math.floor(day.readingMillis / 60000)}`)
                   .fontSize(11)
-                  .fontColor('#68706A')
+                  .fontColor($r('app.color.ui_text_secondary'))
                 Blank()
                   .width(18)
                   .height(Math.min(100, Math.max(4, Math.floor(day.readingMillis / 60000) * 3)))
-                  .backgroundColor('#6E8D7B')
+                  .backgroundColor($r('app.color.ui_accent'))
                   .borderRadius({ topLeft: 6, topRight: 6 })
                   .margin({ top: 5 })
                 Text(day.date)
                   .fontSize(11)
-                  .fontColor('#68706A')
+                  .fontColor($r('app.color.ui_text_secondary'))
                   .margin({ top: 6 })
               }
               .layoutWeight(1)
@@ -2376,7 +2426,7 @@ struct Index {
           if (this.snapshot.books.length === 0) {
             Text('还没有阅读记录')
               .fontSize(16)
-              .fontColor('#777777')
+              .fontColor($r('app.color.ui_text_muted'))
               .margin({ top: 36, bottom: 36 })
           } else {
             List({ space: 4 }) {
@@ -2387,16 +2437,16 @@ struct Index {
                       Text(book.title)
                         .fontSize(16)
                         .fontWeight(FontWeight.Bold)
-                        .fontColor('#242824')
+                        .fontColor($r('app.color.ui_text_primary'))
                         .maxLines(1)
                       Text(`进度 ${book.currentChapterIndex + 1}/${book.totalChapters} · ${this.chapterProgress(book)}%`)
                         .fontSize(13)
-                        .fontColor('#707670')
+                        .fontColor($r('app.color.ui_text_secondary'))
                         .margin({ top: 5 })
                     }
                     .layoutWeight(1)
                     .alignItems(HorizontalAlign.Start)
-                    Text('›').fontSize(26).fontColor('#777777')
+                    Text('›').fontSize(26).fontColor($r('app.color.ui_text_muted'))
                   }
                   .height(66)
                   .width('100%')
@@ -2418,11 +2468,11 @@ struct Index {
           Text(`${this.snapshot.readingGoalMinutes} 分钟`)
             .fontSize(36)
             .fontWeight(FontWeight.Bold)
-            .fontColor('#456653')
+            .fontColor($r('app.color.ui_text_accent'))
             .margin({ top: 38 })
           Text('每天留一点时间给阅读')
             .fontSize(14)
-            .fontColor('#737A75')
+            .fontColor($r('app.color.ui_text_secondary'))
             .margin({ top: 6, bottom: 24 })
           Slider({ value: this.snapshot.readingGoalMinutes, min: 5, max: 180, step: 5 })
             .selectedColor('#486555')
@@ -2436,12 +2486,12 @@ struct Index {
             ForEach([15, 30, 60, 90], (minutes: number) => {
               Text(`${minutes}分`)
                 .fontSize(14)
-                .fontColor(this.snapshot.readingGoalMinutes === minutes ? '#FFFFFF' : '#465049')
+                .fontColor(this.snapshot.readingGoalMinutes === minutes ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
                 .textAlign(TextAlign.Center)
                 .layoutWeight(1)
                 .height(40)
                 .borderRadius(20)
-                .backgroundColor(this.snapshot.readingGoalMinutes === minutes ? '#486555' : '#EEF1ED')
+                .backgroundColor(this.snapshot.readingGoalMinutes === minutes ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
                 .margin({ right: minutes < 90 ? 8 : 0 })
                 .onClick(() => {
                   this.snapshot.readingGoalMinutes = minutes;
@@ -2459,11 +2509,11 @@ struct Index {
                 Row() {
                   Text(category)
                     .fontSize(16)
-                    .fontColor('#252A26')
+                    .fontColor($r('app.color.ui_text_primary'))
                     .layoutWeight(1)
                   Text(this.categoryFilter === category ? '✓' : '')
                     .fontSize(18)
-                    .fontColor('#486555')
+                    .fontColor($r('app.color.ui_text_accent'))
                 }
                 .height(54)
                 .width('100%')
@@ -2482,7 +2532,7 @@ struct Index {
           if (this.snapshot.books.length === 0) {
             Text('还没有导入记录')
               .fontSize(16)
-              .fontColor('#777777')
+              .fontColor($r('app.color.ui_text_muted'))
               .margin({ top: 36, bottom: 36 })
           } else {
             List({ space: 4 }) {
@@ -2493,11 +2543,11 @@ struct Index {
                     Text(book.title)
                       .fontSize(16)
                       .fontWeight(FontWeight.Bold)
-                      .fontColor('#252A26')
+                      .fontColor($r('app.color.ui_text_primary'))
                       .width('100%')
                     Text(`${book.fileType.toUpperCase()} · ${book.totalChapters}章 · ${this.localDateKey(book.createdAt)}`)
                       .fontSize(13)
-                      .fontColor('#747B76')
+                      .fontColor($r('app.color.ui_text_muted'))
                       .width('100%')
                       .margin({ top: 5 })
                   }
@@ -2514,7 +2564,7 @@ struct Index {
         } else if (this.utilityPage === 'background') {
           Text(`背景透明度 ${Math.round(this.backgroundOpacity * 100)}%`)
             .fontSize(16)
-            .fontColor('#39423C')
+            .fontColor($r('app.color.ui_text_primary'))
             .width('100%')
             .margin({ top: 26, bottom: 12 })
           Slider({ value: this.backgroundOpacity, min: 0.15, max: 0.95, step: 0.05 })
@@ -2539,20 +2589,23 @@ struct Index {
         } else if (this.utilityPage === 'online') {
           Text('使用与安卓版本相同的在线书源规则，选择结果后会下载全部章节并直接加入书架。')
             .fontSize(14)
-            .fontColor('#6B736E')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 20, bottom: 14 })
           TextInput({ text: this.onlineKeyword, placeholder: '书名或作者' })
             .height(50)
             .fontSize(16)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .onChange((value: string) => this.onlineKeyword = value)
           Button(this.onlineBusy ? '搜索中…' : '开始搜索')
             .width('100%')
             .height(48)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#486555')
+            .fontColor($r('app.color.ui_text_on_accent'))
+            .backgroundColor($r('app.color.ui_accent'))
             .margin({ top: 14, bottom: 10 })
             .enabled(!this.onlineBusy && this.onlineDownloadingUrl.length === 0)
             .onClick((): void => {
@@ -2575,11 +2628,11 @@ struct Index {
                         Text(result.bookName)
                           .fontSize(16)
                           .fontWeight(FontWeight.Bold)
-                          .fontColor('#252A26')
+                          .fontColor($r('app.color.ui_text_primary'))
                           .maxLines(1)
                         Text(`${result.author.length > 0 ? result.author : '未知作者'} · ${result.sourceName}`)
                           .fontSize(12)
-                          .fontColor('#737A75')
+                          .fontColor($r('app.color.ui_text_secondary'))
                           .margin({ top: 4 })
                           .maxLines(1)
                       }
@@ -2588,8 +2641,8 @@ struct Index {
                       Button(this.onlineDownloadingUrl === result.url ? '下载中' : '下载')
                         .height(36)
                         .fontSize(13)
-                        .fontColor('#FFFFFF')
-                        .backgroundColor('#486555')
+                        .fontColor($r('app.color.ui_text_on_accent'))
+                        .backgroundColor($r('app.color.ui_accent'))
                         .enabled(this.onlineDownloadingUrl.length === 0 && !this.onlineBusy)
                         .onClick((): void => {
                           this.downloadOnline(result);
@@ -2599,7 +2652,7 @@ struct Index {
                     if (result.latestChapter.length > 0) {
                       Text(`最新：${result.latestChapter}`)
                         .fontSize(12)
-                        .fontColor('#747B76')
+                        .fontColor($r('app.color.ui_text_muted'))
                         .maxLines(1)
                         .width('100%')
                         .margin({ top: 6 })
@@ -2607,7 +2660,7 @@ struct Index {
                   }
                   .width('100%')
                   .padding(12)
-                  .backgroundColor('#F1F3EF')
+                  .backgroundColor($r('app.color.ui_surface_subtle'))
                   .borderRadius(12)
                 }
               }, (result: OnlineBookResult) => `${result.sourceId}_${result.url}`)
@@ -2619,13 +2672,16 @@ struct Index {
         } else if (this.utilityPage === 'webdav') {
           Text('同步目录和数据格式与安卓版本一致：NovelReaderSync/manifest.json（schema 1）、书籍对象包、阅读进度、书签和笔记可双向互通。')
             .fontSize(14)
-            .fontColor('#6B736E')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 18, bottom: 12 })
           TextInput({ text: this.webDavUrl, placeholder: 'WebDAV 地址，例如 https://dav.example.com/user/' })
             .height(48)
             .fontSize(15)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .onChange((value: string): void => {
               this.webDavUrl = value;
@@ -2633,7 +2689,10 @@ struct Index {
           TextInput({ text: this.webDavUsername, placeholder: '用户名' })
             .height(48)
             .fontSize(15)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .margin({ top: 10 })
             .onChange((value: string): void => {
@@ -2643,7 +2702,10 @@ struct Index {
             .type(InputType.Password)
             .height(48)
             .fontSize(15)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .margin({ top: 10 })
             .onChange((value: string): void => {
@@ -2660,15 +2722,15 @@ struct Index {
             Button('保存')
               .layoutWeight(1)
               .height(44)
-              .fontColor('#3E4A43')
-              .backgroundColor('#EDF1EC')
+              .fontColor($r('app.color.ui_text_primary'))
+              .backgroundColor($r('app.color.ui_surface_button'))
               .enabled(!this.webDavBusy)
               .onClick((): void => this.saveWebDav())
             Button('测试连接')
               .layoutWeight(1)
               .height(44)
-              .fontColor('#3E4A43')
-              .backgroundColor('#EDF1EC')
+              .fontColor($r('app.color.ui_text_primary'))
+              .backgroundColor($r('app.color.ui_surface_button'))
               .margin({ left: 10 })
               .enabled(!this.webDavBusy)
               .onClick((): void => {
@@ -2680,8 +2742,8 @@ struct Index {
           Button(this.webDavBusy ? '同步中…' : '立即双向同步')
             .width('100%')
             .height(48)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#486555')
+            .fontColor($r('app.color.ui_text_on_accent'))
+            .backgroundColor($r('app.color.ui_accent'))
             .margin({ top: 10, bottom: 8 })
             .enabled(!this.webDavBusy)
             .onClick((): void => {
@@ -2691,27 +2753,30 @@ struct Index {
           TextInput({ text: this.profileNameDraft, placeholder: '昵称' })
             .height(50)
             .fontSize(16)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .margin({ top: 20 })
             .onChange((value: string) => this.profileNameDraft = value)
           Button('保存昵称')
             .width('100%')
             .height(46)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#486555')
+            .fontColor($r('app.color.ui_text_on_accent'))
+            .backgroundColor($r('app.color.ui_accent'))
             .margin({ top: 12 })
             .onClick(() => this.saveProfile())
           Button('清除阅读统计')
             .width('100%')
             .height(46)
-            .fontColor('#B74434')
-            .backgroundColor('#F8ECE9')
+            .fontColor($r('app.color.ui_text_error'))
+            .backgroundColor($r('app.color.ui_surface_error'))
             .margin({ top: 12 })
             .onClick(() => this.confirmClearReadingStats())
           Text('小说阅读器 HarmonyOS\n支持 TXT / EPUB 本地阅读、书签、笔记、统计和备份恢复。')
             .fontSize(14)
-            .fontColor('#737A75')
+            .fontColor($r('app.color.ui_text_secondary'))
             .textAlign(TextAlign.Center)
             .width('100%')
             .margin({ top: 24, bottom: 12 })
@@ -2720,7 +2785,10 @@ struct Index {
             .maxLength(80)
             .height(48)
             .fontSize(16)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .margin({ top: 18 })
             .onChange((value: string) => this.bookTitleDraft = value)
@@ -2728,37 +2796,40 @@ struct Index {
             .maxLength(20)
             .height(48)
             .fontSize(16)
-            .backgroundColor('#F1F3EF')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .margin({ top: 12, bottom: 8 })
             .onChange((value: string) => this.bookCategoryDraft = value)
           Button('保存书名与分类')
             .width('100%')
             .height(46)
-            .fontColor('#FFFFFF')
-            .backgroundColor('#486555')
+            .fontColor($r('app.color.ui_text_on_accent'))
+            .backgroundColor($r('app.color.ui_accent'))
             .margin({ top: 10 })
             .onClick(() => this.saveSelectedBookDetails())
           if (this.selectedBook() !== undefined) {
             Button(this.selectedBookPinned() ? '取消置顶' : '置顶书籍')
               .width('100%')
               .height(46)
-              .fontColor('#3E4A43')
-              .backgroundColor('#EDF1EC')
+              .fontColor($r('app.color.ui_text_primary'))
+              .backgroundColor($r('app.color.ui_surface_button'))
               .margin({ top: 10 })
               .onClick(() => this.toggleSelectedBookPin())
             Button(this.selectedBookFinished() ? '标为正在阅读' : '标为已读完')
               .width('100%')
               .height(46)
-              .fontColor('#3E4A43')
-              .backgroundColor('#EDF1EC')
+              .fontColor($r('app.color.ui_text_primary'))
+              .backgroundColor($r('app.color.ui_surface_button'))
               .margin({ top: 10 })
               .onClick(() => this.toggleSelectedBookFinished())
             Button('移除书籍')
               .width('100%')
               .height(46)
-              .fontColor('#B74434')
-              .backgroundColor('#F8ECE9')
+              .fontColor($r('app.color.ui_text_error'))
+              .backgroundColor($r('app.color.ui_surface_error'))
               .margin({ top: 10, bottom: 8 })
               .onClick((): void => {
                 const book = this.selectedBook();
@@ -2774,7 +2845,7 @@ struct Index {
       }
       .width('92%')
       .padding({ left: 22, right: 22, top: 20, bottom: 20 })
-      .backgroundColor('#FCFDFB')
+      .backgroundColor($r('app.color.ui_surface_overlay'))
       .borderRadius(22)
       .shadow({ radius: 22, color: '#44000000', offsetY: 8 })
       .opacity(this.utilityProgress)
@@ -2791,7 +2862,7 @@ struct Index {
         Text(this.readerSelectionHasMark() ? '删除标记' : '标记')
           .fontSize(15)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
+          .fontColor($r('app.color.ui_text_on_accent'))
           .height(42)
           .padding({ left: 18, right: 18 })
           .textAlign(TextAlign.Center)
@@ -2805,7 +2876,7 @@ struct Index {
         Text('复制')
           .fontSize(15)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
+          .fontColor($r('app.color.ui_text_on_accent'))
           .height(42)
           .padding({ left: 18, right: 18 })
           .textAlign(TextAlign.Center)
@@ -2815,7 +2886,7 @@ struct Index {
         Text('评论')
           .fontSize(15)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#FFFFFF')
+          .fontColor($r('app.color.ui_text_on_accent'))
           .height(42)
           .padding({ left: 18, right: 18 })
           .textAlign(TextAlign.Center)
@@ -2836,7 +2907,7 @@ struct Index {
         .padding({ left: 10, right: 10, bottom: 6 })
       }
     }
-    .backgroundColor('#F02E2E2E')
+    .backgroundColor($r('app.color.ui_selection_surface'))
     .borderRadius(12)
     .shadow({ radius: 10, color: '#55000000', offsetY: 4 })
   }
@@ -2952,7 +3023,7 @@ struct Index {
 
       Text(`${this.readerPageIndex + 1}/${Math.max(1, this.readerPages.length)}`)
         .fontSize(12)
-        .fontColor(this.readerThemeMode === 3 ? '#9AA19D' : '#777D79')
+        .fontColor(AppTheme.readerSecondaryTextColor(this.readerThemeMode, this.systemDarkMode))
         .position({ x: '82%', y: '94%' })
         .opacity(this.pageDragActive ? 0 : 1)
     }
@@ -2980,19 +3051,19 @@ struct Index {
     Row() {
       Text('‹')
         .fontSize(34)
-        .fontColor('#F0ECE6')
+        .fontColor($r('app.color.ui_reader_controls_text'))
         .width(48)
         .onClick(() => this.closeReader())
       Column() {
         Text(this.currentBookTitle())
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
-          .fontColor('#F0ECE6')
+          .fontColor($r('app.color.ui_reader_controls_text'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(`${this.chapterIndex + 1} / ${this.chapters.length}`)
           .fontSize(11)
-          .fontColor('#B8B3AD')
+          .fontColor($r('app.color.ui_reader_controls_secondary'))
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Center)
@@ -3002,7 +3073,7 @@ struct Index {
     .height(88)
     .width('100%')
     .padding({ left: 8, right: 8, top: 28 })
-    .backgroundColor('#E61E1A19')
+    .backgroundColor($r('app.color.ui_reader_controls'))
     .opacity(this.readerControlsProgress)
     .translate({ y: (this.readerControlsProgress - 1) * 88 })
     .position({ x: 0, y: 0 })
@@ -3014,7 +3085,7 @@ struct Index {
     Row() {
       Text('目录')
         .fontSize(15)
-        .fontColor('#F0ECE6')
+        .fontColor($r('app.color.ui_reader_controls_text'))
         .width('25%')
         .textAlign(TextAlign.Center)
         .onClick(() => this.openCatalog())
@@ -3026,12 +3097,12 @@ struct Index {
         .onClick(() => this.toggleBookmark())
       Text(this.readerReadMode === 0 ? '长按标记' : '长按笔记')
         .fontSize(13)
-        .fontColor('#B8B3AD')
+        .fontColor($r('app.color.ui_reader_controls_secondary'))
         .width('25%')
         .textAlign(TextAlign.Center)
       Text('设置')
         .fontSize(15)
-        .fontColor('#F0ECE6')
+        .fontColor($r('app.color.ui_reader_controls_text'))
         .width('25%')
         .textAlign(TextAlign.Center)
         .onClick(() => this.openSettings())
@@ -3039,7 +3110,7 @@ struct Index {
     .height(64)
     .width('100%')
     .padding({ bottom: 10 })
-    .backgroundColor('#E61E1A19')
+    .backgroundColor($r('app.color.ui_reader_controls'))
     .border({ width: { top: 0.5 }, color: '#66807B76' })
     .opacity(this.readerControlsProgress)
     .translate({ y: (1 - this.readerControlsProgress) * 64 })
@@ -3118,7 +3189,7 @@ struct Index {
                 .onClick(() => this.changeChapter(this.chapterIndex - 1))
               Blank()
               Button(this.chapterIndex + 1 >= this.chapters.length ? '已读完' : '下一章')
-                .enabled(this.chapterIndex + 1 < this.chapters.length)
+                .enabled(this.chapterIndex + 1 < this.chapters.length || this.pendingChapters())
                 .fontColor(this.readerTextColor())
                 .backgroundColor('#00000000')
                 .onClick(() => this.changeChapter(this.chapterIndex + 1))
@@ -3166,11 +3237,11 @@ struct Index {
               Text('目录')
                 .fontSize(23)
                 .fontWeight(FontWeight.Bold)
-                .fontColor('#27312B')
+                .fontColor($r('app.color.ui_text_primary'))
               Blank()
               Text('×')
                 .fontSize(28)
-                .fontColor('#67726B')
+                .fontColor($r('app.color.ui_text_secondary'))
                 .onClick(() => this.closeCatalog())
             }
             .width('100%')
@@ -3182,12 +3253,12 @@ struct Index {
                   Text(tab[1])
                     .fontSize(15)
                     .fontWeight(this.drawerTab === tab[0] ? FontWeight.Bold : FontWeight.Normal)
-                    .fontColor(this.drawerTab === tab[0] ? '#365444' : '#737D76')
+                    .fontColor(this.drawerTab === tab[0] ? $r('app.color.ui_text_accent') : $r('app.color.ui_text_muted'))
                   Blank()
                     .width(28)
                     .height(3)
                     .borderRadius(2)
-                    .backgroundColor(this.drawerTab === tab[0] ? '#486555' : '#00000000')
+                    .backgroundColor(this.drawerTab === tab[0] ? $r('app.color.ui_accent') : '#00000000')
                     .margin({ top: 8 })
                 }
                 .layoutWeight(1)
@@ -3205,15 +3276,15 @@ struct Index {
                     Row() {
                       Text(`${index + 1}`)
                         .fontSize(13)
-                        .fontColor(index === this.chapterIndex ? '#FFFFFF' : '#7B867F')
+                        .fontColor(index === this.chapterIndex ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_muted'))
                         .textAlign(TextAlign.Center)
                         .width(30)
                         .height(30)
                         .borderRadius(15)
-                        .backgroundColor(index === this.chapterIndex ? '#486454' : '#EDF0EC')
+                        .backgroundColor(index === this.chapterIndex ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
                       Text(chapter.title)
                         .fontSize(16)
-                        .fontColor(index === this.chapterIndex ? '#365444' : '#313B35')
+                        .fontColor(index === this.chapterIndex ? $r('app.color.ui_text_accent') : $r('app.color.ui_text_primary'))
                         .fontWeight(index === this.chapterIndex ? FontWeight.Bold : FontWeight.Normal)
                         .maxLines(2)
                         .layoutWeight(1)
@@ -3230,7 +3301,7 @@ struct Index {
               if (this.currentBookmarks().length === 0) {
                 Text('还没有书签')
                   .fontSize(16)
-                  .fontColor('#8A918C')
+                  .fontColor($r('app.color.ui_text_muted'))
                   .margin({ top: 44 })
               } else {
                 List() {
@@ -3240,12 +3311,12 @@ struct Index {
                         Text(bookmark.chapterTitle)
                           .fontSize(16)
                           .fontWeight(FontWeight.Bold)
-                          .fontColor('#303A34')
+                          .fontColor($r('app.color.ui_text_primary'))
                           .maxLines(1)
                           .width('100%')
                         Text(bookmark.summary)
                           .fontSize(13)
-                          .fontColor('#727B75')
+                          .fontColor($r('app.color.ui_text_secondary'))
                           .maxLines(2)
                           .width('100%')
                           .margin({ top: 6 })
@@ -3262,7 +3333,7 @@ struct Index {
               if (this.currentNotes().length === 0) {
                 Text('还没有笔记')
                   .fontSize(16)
-                  .fontColor('#8A918C')
+                  .fontColor($r('app.color.ui_text_muted'))
                   .margin({ top: 44 })
               } else {
                 List() {
@@ -3271,13 +3342,13 @@ struct Index {
                       Column() {
                         Text(note.selectedText)
                           .fontSize(14)
-                          .fontColor('#58615B')
+                          .fontColor($r('app.color.ui_text_body'))
                           .maxLines(2)
                           .width('100%')
                         Text(note.noteText)
                           .fontSize(16)
                           .fontWeight(FontWeight.Bold)
-                          .fontColor('#303A34')
+                          .fontColor($r('app.color.ui_text_primary'))
                           .maxLines(2)
                           .width('100%')
                           .margin({ top: 7 })
@@ -3294,7 +3365,7 @@ struct Index {
           }
           .width('84%')
           .height('100%')
-          .backgroundColor('#FAFBF8')
+          .backgroundColor($r('app.color.ui_surface_overlay'))
           .translate({ x: (this.catalogProgress - 1) * 360 })
           Blank()
             .layoutWeight(1)
@@ -3314,11 +3385,11 @@ struct Index {
             Text('阅读设置')
               .fontSize(20)
               .fontWeight(FontWeight.Bold)
-              .fontColor('#252D28')
+              .fontColor($r('app.color.ui_text_primary'))
             Blank()
             Text('完成')
               .fontSize(16)
-              .fontColor('#416550')
+              .fontColor($r('app.color.ui_text_accent'))
               .onClick(() => this.closeSettings())
           }
           .width('100%')
@@ -3326,24 +3397,24 @@ struct Index {
           Row() {
             Text('翻页')
               .fontSize(14)
-              .fontColor(this.readerReadMode === 0 ? '#FFFFFF' : '#445047')
+              .fontColor(this.readerReadMode === 0 ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
               .height(40)
               .borderRadius(20)
-              .backgroundColor(this.readerReadMode === 0 ? '#486555' : '#EEF1ED')
+              .backgroundColor(this.readerReadMode === 0 ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
               .margin({ right: 8 })
               .onClick((): void => {
                 this.setReaderReadMode(0);
               })
             Text('滚动')
               .fontSize(14)
-              .fontColor(this.readerReadMode === 1 ? '#FFFFFF' : '#445047')
+              .fontColor(this.readerReadMode === 1 ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
               .height(40)
               .borderRadius(20)
-              .backgroundColor(this.readerReadMode === 1 ? '#486555' : '#EEF1ED')
+              .backgroundColor(this.readerReadMode === 1 ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
               .onClick((): void => {
                 this.setReaderReadMode(1);
               })
@@ -3353,7 +3424,7 @@ struct Index {
 
           Text(`字号  ${Math.round(this.readerTextSize)}`)
             .fontSize(14)
-            .fontColor('#687169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 22 })
           Slider({ value: this.readerTextSize, min: 14, max: 32, step: 1 })
@@ -3367,7 +3438,7 @@ struct Index {
 
           Text(`行距  ${this.readerLineHeight.toFixed(1)}`)
             .fontSize(14)
-            .fontColor('#687169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 12 })
           Slider({ value: this.readerLineHeight, min: 1.2, max: 2.2, step: 0.1 })
@@ -3381,7 +3452,7 @@ struct Index {
 
           Text(`页边距  ${Math.round(this.readerPageMargin)}`)
             .fontSize(14)
-            .fontColor('#687169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 12 })
           Slider({ value: this.readerPageMargin, min: 12, max: 40, step: 2 })
@@ -3397,12 +3468,12 @@ struct Index {
             ForEach(['默认', '纸张', '护眼', '夜间'], (label: string, index: number) => {
               Text(label)
                 .fontSize(14)
-                .fontColor(this.readerThemeMode === index ? '#FFFFFF' : '#445047')
+                .fontColor(this.readerThemeMode === index ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
                 .textAlign(TextAlign.Center)
                 .layoutWeight(1)
                 .height(40)
                 .borderRadius(20)
-                .backgroundColor(this.readerThemeMode === index ? '#486555' : '#EEF1ED')
+                .backgroundColor(this.readerThemeMode === index ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
                 .margin({ right: index < 3 ? 8 : 0 })
                 .onClick(() => {
                   animateTo({ duration: 180, curve: Curve.EaseOut }, () => {
@@ -3420,7 +3491,7 @@ struct Index {
         .width('100%')
         .height(this.readerSettingsPanelHeight())
         .scrollBar(BarState.Off)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor($r('app.color.ui_surface'))
         .borderRadius({ topLeft: 22, topRight: 22 })
         .position({ x: 0, y: this.readerSettingsPanelTop() })
         .shadow({ radius: 22, color: '#33000000', offsetY: -4 })
@@ -3434,18 +3505,18 @@ struct Index {
             Text(this.editingNoteId.length === 0 ? '写笔记' : '编辑笔记')
               .fontSize(20)
               .fontWeight(FontWeight.Bold)
-              .fontColor('#27312B')
+              .fontColor($r('app.color.ui_text_primary'))
             Blank()
             Text('取消')
               .fontSize(15)
-              .fontColor('#737D76')
+              .fontColor($r('app.color.ui_text_muted'))
               .onClick(() => this.closeNoteEditor())
           }
           .width('100%')
           Text(this.noteParagraphIndex >= 0 && this.noteParagraphIndex < this.paragraphs().length ?
             this.paragraphs()[this.noteParagraphIndex] : '')
             .fontSize(14)
-            .fontColor('#6C756F')
+            .fontColor($r('app.color.ui_text_secondary'))
             .maxLines(3)
             .width('100%')
             .margin({ top: 14, bottom: 12 })
@@ -3453,20 +3524,23 @@ struct Index {
             .maxLength(2000)
             .fontSize(16)
             .height(120)
-            .backgroundColor('#F3F5F1')
+            .fontColor($r('app.color.ui_text_primary'))
+            .placeholderColor($r('app.color.ui_text_muted'))
+            .caretColor($r('app.color.ui_text_accent'))
+            .backgroundColor($r('app.color.ui_surface_subtle'))
             .borderRadius(12)
             .onChange((value: string) => this.noteDraft = value)
           Row() {
             if (this.editingNoteId.length > 0) {
               Button('删除')
-                .fontColor('#B74434')
-                .backgroundColor('#F8ECE9')
+                .fontColor($r('app.color.ui_text_error'))
+                .backgroundColor($r('app.color.ui_surface_error'))
                 .onClick(() => this.deleteEditingNote())
             }
             Blank()
             Button('保存')
-              .fontColor('#FFFFFF')
-              .backgroundColor('#486555')
+              .fontColor($r('app.color.ui_text_on_accent'))
+              .backgroundColor($r('app.color.ui_accent'))
               .enabled(this.noteDraft.trim().length > 0)
               .onClick(() => this.saveNote())
           }
@@ -3475,7 +3549,7 @@ struct Index {
         }
         .width('100%')
         .padding({ left: 22, right: 22, top: 20, bottom: 24 })
-        .backgroundColor('#FFFFFF')
+        .backgroundColor($r('app.color.ui_surface'))
         .borderRadius({ topLeft: 22, topRight: 22 })
         .position({ x: 0, y: '42%' })
         .shadow({ radius: 24, color: '#44000000', offsetY: -4 })

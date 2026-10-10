@@ -5,11 +5,112 @@ import { LibraryStore } from '../main/ets/data/LibraryStore';
 import { OnlineRuleAdapter } from '../main/ets/data/OnlineRuleAdapter';
 import { OnlineSearchGrouper } from '../main/ets/data/OnlineSearchGrouper';
 import { OnlinePageExtractor } from '../main/ets/data/OnlinePageExtractor';
+import { OnlineChapterPublisher, OnlineDownloadState } from '../main/ets/data/OnlineDownloadState';
+import { OnlineDownloadCancelToken, OnlineSearchOptions } from '../main/ets/data/OnlineBookService';
 import { SimpleHtml } from '../main/ets/data/SimpleHtml';
-import { LibrarySnapshot, OnlineBookResult, OnlineExtractionRule } from '../main/ets/model/Models';
+import { AppTheme } from '../main/ets/data/AppTheme';
+import { BookRecord, ChapterRecord, LibrarySnapshot, OnlineBookResult, OnlineExtractionRule } from '../main/ets/model/Models';
 
 export default function localUnitTest() {
   describe('bookParser', () => {
+    it('searchHasBoundedRequestSourceAndSessionDeadlines', 0, () => {
+      const options = new OnlineSearchOptions();
+      expect(options.requestTimeoutMillis).assertEqual(8000);
+      expect(options.sourceTimeoutMillis).assertEqual(20000);
+      expect(options.totalTimeoutMillis).assertEqual(60000);
+    });
+
+    it('searchCancellationKeepsItsReasonWithoutChangingDownloadDefaults', 0, () => {
+      const search = new OnlineDownloadCancelToken('搜索已取消');
+      search.cancel('书源搜索超时，已跳过');
+      expect(search.cancelled).assertTrue();
+      expect(search.reason).assertEqual('书源搜索超时，已跳过');
+      search.cancel('不应覆盖第一次取消');
+      expect(search.reason).assertEqual('书源搜索超时，已跳过');
+      expect(new OnlineDownloadCancelToken().reason).assertEqual('下载已取消');
+    });
+
+    it('systemDarkModeMakesEveryReaderThemeBlackWithLightText', 0, () => {
+      for (let theme = 0; theme < 4; theme++) {
+        expect(AppTheme.readerBackground(theme, true)).assertEqual('#000000');
+        expect(AppTheme.readerTextColor(theme, true)).assertEqual('#D7D9D7');
+        expect(AppTheme.readerSecondaryTextColor(theme, true)).assertEqual('#A7ABA8');
+        expect(AppTheme.readerBarBackground(theme, true)).assertEqual('#F0181818');
+      }
+    });
+
+    it('leavingSystemDarkModeRestoresTheSelectedReaderTheme', 0, () => {
+      expect(AppTheme.readerBackground(0, false)).assertEqual('#F7F4ED');
+      expect(AppTheme.readerBackground(1, false)).assertEqual('#E7E1CF');
+      expect(AppTheme.readerBackground(2, false)).assertEqual('#DDE8DD');
+      expect(AppTheme.readerBackground(3, false)).assertEqual('#1D211F');
+      expect(AppTheme.readerTextColor(0, false)).assertEqual('#282A27');
+      expect(AppTheme.readerTextColor(3, false)).assertEqual('#D7D9D7');
+    });
+
+    it('publishesOnlyContiguousChaptersWhenWorkersFinishOutOfOrder', 0, () => {
+      const publisher = new OnlineChapterPublisher();
+      expect(publisher.complete(2, new ChapterRecord('第三章', '三')).length).assertEqual(0);
+      expect(publisher.complete(0, new ChapterRecord('第一章', '一')).length).assertEqual(1);
+      expect(publisher.readable().length).assertEqual(1);
+      expect(publisher.complete(1, new ChapterRecord('第二章', '二')).length).assertEqual(2);
+      expect(publisher.readable().map((chapter: ChapterRecord): string => chapter.content).join('')).assertEqual('一二三');
+      expect(publisher.complete(1, new ChapterRecord('重复', '错误')).length).assertEqual(0);
+    });
+
+    it('downloadRefreshPreservesReadingPositionAndUserMetadata', 0, () => {
+      const current = new BookRecord();
+      current.title = '用户改名';
+      current.currentChapterIndex = 2;
+      current.currentPageIndex = 7;
+      current.scrollOffset = 123;
+      current.pinnedAt = 10;
+      const downloaded = new BookRecord();
+      downloaded.totalChapters = 100;
+      downloaded.availableChapters = 8;
+      downloaded.downloadComplete = false;
+      downloaded.downloadRevision = 3;
+      OnlineDownloadState.applyMetadata(current, downloaded);
+      expect(current.availableChapters).assertEqual(8);
+      expect(current.currentPageIndex).assertEqual(7);
+      expect(current.scrollOffset).assertEqual(123);
+      expect(current.title).assertEqual('用户改名');
+      expect(current.pinnedAt).assertEqual(10);
+      expect(OnlineDownloadState.incomplete(current)).assertTrue();
+    });
+
+    it('cancellationAbortsRegisteredWorkOnlyOnce', 0, () => {
+      const token = new OnlineDownloadCancelToken();
+      let aborted = 0;
+      const callback = (): void => { aborted++; };
+      const removed = (): void => { aborted += 100; };
+      token.register(callback);
+      token.register(removed);
+      token.unregister(removed);
+      token.cancel();
+      token.cancel();
+      expect(aborted).assertEqual(1);
+      token.register(callback);
+      expect(aborted).assertEqual(2);
+    });
+
+    it('keepsDecodedBodyWhenFilteringScriptAds', 0, () => {
+      const document = SimpleHtml.parse("<div id='content'><script>document.writeln(qsbs.bb('PHA+5L2g5aW9PC9wPg=='));</script><script>广告脚本</script></div>", 'https://example.com/');
+      const content = SimpleHtml.select(document, '#content')[0];
+      OnlineRuleAdapter.prepareChapterContent(content, '#content@java:base64.decode()');
+      SimpleHtml.select(content, 'script').forEach((node): void => node.remove());
+      expect(content.text()).assertEqual('你好');
+    });
+
+    it('supportsUpdatedSourceXPathPaginationAndScriptPositions', 0, () => {
+      const document = SimpleHtml.parse('<div class="onlypc"><div><a>首页</a><a href="2">2</a><a>下一页</a></div></div>' +
+        '<div id="readbg"><script>one</script><p>body</p><script>two</script><script>three</script><script>four</script></div>', 'https://example.com/');
+      const pages = SimpleHtml.select(document, "//div[@class='onlypc']//div//a[not(text()='首页') and not(text()='上一页') and not(text()='下一页') and not(text()='尾页')]");
+      expect(pages.length).assertEqual(1);
+      expect(pages[0].text()).assertEqual('2');
+      expect(SimpleHtml.select(document, '//*[@id="readbg"]/script[4]')[0].text()).assertEqual('four');
+    });
+
     it('splitsCommonHeadingsInAutomaticMode', 0, () => {
       const parsed = TxtParser.parse('序章\n开场\n第1章 初见\n正文一\nChapter 2 Again\n正文二', 'sample.txt');
       expect(parsed.title).assertEqual('sample');

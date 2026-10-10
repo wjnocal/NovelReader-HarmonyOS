@@ -11,6 +11,7 @@ import {
   NoteRecord
 } from '../model/Models';
 import { LibraryStore } from './LibraryStore';
+import { OnlineDownloadManager } from './OnlineDownloadManager';
 
 export class BackupService {
   static async exportBackup(context: common.UIAbilityContext, snapshot: LibrarySnapshot): Promise<void> {
@@ -48,6 +49,7 @@ export class BackupService {
   }
 
   static async importBackup(context: common.UIAbilityContext): Promise<number> {
+    if (OnlineDownloadManager.shared().isRunning()) throw new Error('请先完成或取消下载，再恢复备份');
     const options = new picker.DocumentSelectOptions();
     options.fileSuffixFilters = ['NovelReader 备份|.json'];
     options.maxSelectNumber = 1;
@@ -76,7 +78,11 @@ export class BackupService {
         existing.description = item.book.description;
         existing.originalFilePath = '';
         existing.chapterFilePath = chapterPath;
-        existing.totalChapters = item.chapters.length;
+        existing.totalChapters = item.book.downloadComplete === false ? item.book.totalChapters : item.chapters.length;
+        existing.downloadComplete = item.book.downloadComplete ?? true;
+        existing.downloadKey = item.book.downloadKey ?? '';
+        existing.availableChapters = item.chapters.length;
+        existing.downloadRevision = (existing.downloadRevision ?? 0) + 1;
         existing.currentChapterIndex = Math.max(0, Math.min(item.book.currentChapterIndex, item.chapters.length - 1));
         existing.currentPageIndex = Math.max(0, item.book.currentPageIndex);
         existing.scrollOffset = Math.max(0, item.book.scrollOffset);
@@ -95,7 +101,9 @@ export class BackupService {
       book.id = newId;
       book.originalFilePath = '';
       book.chapterFilePath = `${directory}/chapters.json`;
-      book.totalChapters = item.chapters.length;
+      book.totalChapters = item.book.downloadComplete === false ? item.book.totalChapters : item.chapters.length;
+      book.availableChapters = item.chapters.length;
+      if (book.downloadKey.length > 0) book.syncId = `online-${newId}`;
       book.updatedAt = Date.now();
       LibraryStore.saveChapters(book.chapterFilePath, item.chapters);
       snapshot.books.push(book);
@@ -187,6 +195,10 @@ export class BackupService {
     book.originalFilePath = source.originalFilePath;
     book.chapterFilePath = source.chapterFilePath;
     book.totalChapters = source.totalChapters;
+    book.downloadKey = source.downloadKey ?? '';
+    book.downloadComplete = source.downloadComplete ?? true;
+    book.availableChapters = source.availableChapters ?? source.totalChapters;
+    book.downloadRevision = source.downloadRevision ?? 0;
     book.currentChapterIndex = source.currentChapterIndex;
     book.currentPageIndex = source.currentPageIndex;
     book.scrollOffset = source.scrollOffset;

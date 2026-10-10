@@ -28,17 +28,15 @@ export class OnlineBookExporter {
 
   private static writeTxt(path: string, title: string, author: string, description: string,
     chapters: Array<ChapterRecord>): void {
-    const parts = new Array<string>();
-    parts.push(title);
-    parts.push(`作者：${author}`);
-    if (description.trim().length > 0) {
-      parts.push(description.trim());
+    const file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+    try {
+      fs.writeSync(file.fd, `${title}\n\n作者：${author}\n\n${description.trim()}\n\n`);
+      chapters.forEach((chapter: ChapterRecord): void => {
+        fs.writeSync(file.fd, `${chapter.title}\n\n${chapter.content}\n\n`);
+      });
+    } finally {
+      fs.closeSync(file);
     }
-    chapters.forEach((chapter: ChapterRecord): void => {
-      parts.push(chapter.title);
-      parts.push(chapter.content);
-    });
-    OnlineBookExporter.writeText(path, parts.join('\n\n'));
   }
 
   private static async writeEpub(directory: string, output: string, title: string, author: string,

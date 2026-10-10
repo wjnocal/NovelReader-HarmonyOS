@@ -3,6 +3,110 @@
     {
       "name": "start_window_background",
       "value": "#000000"
+    },
+    {
+      "name": "ui_background",
+      "value": "#000000"
+    },
+    {
+      "name": "ui_page_background",
+      "value": "#000000"
+    },
+    {
+      "name": "ui_surface",
+      "value": "#181818"
+    },
+    {
+      "name": "ui_surface_overlay",
+      "value": "#F51B1B1B"
+    },
+    {
+      "name": "ui_shelf_card",
+      "value": "#E61B1B1B"
+    },
+    {
+      "name": "ui_shelf_input",
+      "value": "#262626"
+    },
+    {
+      "name": "ui_surface_subtle",
+      "value": "#252525"
+    },
+    {
+      "name": "ui_surface_button",
+      "value": "#292929"
+    },
+    {
+      "name": "ui_surface_success",
+      "value": "#18251D"
+    },
+    {
+      "name": "ui_surface_error",
+      "value": "#342121"
+    },
+    {
+      "name": "ui_text_primary",
+      "value": "#F2F2F2"
+    },
+    {
+      "name": "ui_text_body",
+      "value": "#DEDEDE"
+    },
+    {
+      "name": "ui_text_secondary",
+      "value": "#B7BDB9"
+    },
+    {
+      "name": "ui_text_muted",
+      "value": "#A1A8A3"
+    },
+    {
+      "name": "ui_text_accent",
+      "value": "#A7D4B7"
+    },
+    {
+      "name": "ui_text_error",
+      "value": "#FF9F93"
+    },
+    {
+      "name": "ui_accent",
+      "value": "#486555"
+    },
+    {
+      "name": "ui_browser_accent",
+      "value": "#476A58"
+    },
+    {
+      "name": "ui_brand",
+      "value": "#EB9F95"
+    },
+    {
+      "name": "ui_brand_background",
+      "value": "#9F493F"
+    },
+    {
+      "name": "ui_border",
+      "value": "#444A46"
+    },
+    {
+      "name": "ui_text_on_accent",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "ui_reader_controls",
+      "value": "#F2181818"
+    },
+    {
+      "name": "ui_reader_controls_text",
+      "value": "#F0ECE6"
+    },
+    {
+      "name": "ui_reader_controls_secondary",
+      "value": "#B8B3AD"
+    },
+    {
+      "name": "ui_selection_surface",
+      "value": "#F02E2E2E"
     }
   ]
 }

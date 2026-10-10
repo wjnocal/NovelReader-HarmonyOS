@@ -28,6 +28,10 @@ export class BookRecord {
   syncId: string = '';
   syncContentHash: string = '';
   syncUpdatedAt: number = 0;
+  downloadKey: string = '';
+  downloadComplete: boolean = true;
+  availableChapters: number = 0;
+  downloadRevision: number = 0;
 }
 
 export class BookmarkRecord {

@@ -1,6 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { webview } from '@kit.ArkWeb';
 import { LibraryStore } from '../data/LibraryStore';
+import { AppTheme } from '../data/AppTheme';
 import { OnlineBookService } from '../data/OnlineBookService';
 import { OnlinePageContent, OnlinePageExtractor } from '../data/OnlinePageExtractor';
 import { OnlineExtractionRule } from '../model/Models';
@@ -12,6 +13,7 @@ class OnlineReaderParams {
 @Entry
 @Component
 struct OnlineReader {
+  @StorageLink('systemDarkMode') private systemDarkMode: boolean = false;
   @State private webSrc: string = 'about:blank';
   @State private currentUrl: string = '';
   @State private bookTitle: string = '在线阅读';
@@ -183,28 +185,19 @@ struct OnlineReader {
   }
 
   private readerBackground(): string {
-    switch (this.themeMode) {
-      case 1:
-        return '#E7E1CF';
-      case 2:
-        return '#DDE8DD';
-      case 3:
-        return '#1D211F';
-      default:
-        return '#F7F4ED';
-    }
+    return AppTheme.readerBackground(this.themeMode, this.systemDarkMode);
   }
 
   private readerTextColor(): string {
-    return this.themeMode === 3 ? '#D7D9D7' : '#282A27';
+    return AppTheme.readerTextColor(this.themeMode, this.systemDarkMode);
   }
 
   private secondaryTextColor(): string {
-    return this.themeMode === 3 ? '#A7ABA8' : '#687169';
+    return AppTheme.readerSecondaryTextColor(this.themeMode, this.systemDarkMode);
   }
 
   private barBackground(): string {
-    return this.themeMode === 3 ? '#F0242826' : '#F7F4ED';
+    return AppTheme.readerBarBackground(this.themeMode, this.systemDarkMode);
   }
 
   private readerSafeTop(): number {
@@ -460,8 +453,8 @@ struct OnlineReader {
           .textAlign(TextAlign.Center)
           .padding({ left: 28, right: 28 })
         Button('返回浏览器')
-          .fontColor('#FFFFFF')
-          .backgroundColor('#476A58')
+          .fontColor($r('app.color.ui_text_on_accent'))
+          .backgroundColor($r('app.color.ui_browser_accent'))
           .onClick((): void => this.getUIContext().getRouter().back())
       }
       .width('100%')
@@ -564,40 +557,40 @@ struct OnlineReader {
             Text('阅读设置')
               .fontSize(20)
               .fontWeight(FontWeight.Bold)
-              .fontColor('#252D28')
+              .fontColor($r('app.color.ui_text_primary'))
             Blank()
             Text('完成')
               .fontSize(16)
-              .fontColor('#416550')
+              .fontColor($r('app.color.ui_text_accent'))
               .onClick((): void => this.closeSettings())
           }
           .width('100%')
           Row() {
             Text('翻页')
               .fontSize(14)
-              .fontColor(this.readMode === 0 ? '#FFFFFF' : '#445047')
+              .fontColor(this.readMode === 0 ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
               .height(40)
               .borderRadius(20)
-              .backgroundColor(this.readMode === 0 ? '#486555' : '#EEF1ED')
+              .backgroundColor(this.readMode === 0 ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
               .margin({ right: 8 })
               .onClick((): void => this.setReadMode(0))
             Text('滚动')
               .fontSize(14)
-              .fontColor(this.readMode === 1 ? '#FFFFFF' : '#445047')
+              .fontColor(this.readMode === 1 ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
               .textAlign(TextAlign.Center)
               .layoutWeight(1)
               .height(40)
               .borderRadius(20)
-              .backgroundColor(this.readMode === 1 ? '#486555' : '#EEF1ED')
+              .backgroundColor(this.readMode === 1 ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
               .onClick((): void => this.setReadMode(1))
           }
           .width('100%')
           .margin({ top: 18 })
           Text(`字号  ${Math.round(this.textSize)}`)
             .fontSize(14)
-            .fontColor('#687169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 22 })
           Slider({ value: this.textSize, min: 14, max: 32, step: 1 })
@@ -608,7 +601,7 @@ struct OnlineReader {
             })
           Text(`行距  ${this.lineHeight.toFixed(1)}`)
             .fontSize(14)
-            .fontColor('#687169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 12 })
           Slider({ value: this.lineHeight, min: 1.2, max: 2.2, step: 0.1 })
@@ -619,7 +612,7 @@ struct OnlineReader {
             })
           Text(`页边距  ${Math.round(this.pageMargin)}`)
             .fontSize(14)
-            .fontColor('#687169')
+            .fontColor($r('app.color.ui_text_secondary'))
             .width('100%')
             .margin({ top: 12 })
           Slider({ value: this.pageMargin, min: 12, max: 40, step: 2 })
@@ -634,10 +627,10 @@ struct OnlineReader {
                 .layoutWeight(1)
                 .height(40)
                 .fontSize(14)
-                .fontColor(this.themeMode === index ? '#FFFFFF' : '#445047')
+                .fontColor(this.themeMode === index ? $r('app.color.ui_text_on_accent') : $r('app.color.ui_text_primary'))
                 .textAlign(TextAlign.Center)
                 .borderRadius(20)
-                .backgroundColor(this.themeMode === index ? '#486555' : '#EEF1ED')
+                .backgroundColor(this.themeMode === index ? $r('app.color.ui_accent') : $r('app.color.ui_surface_button'))
                 .margin({ right: index < 3 ? 8 : 0 })
                 .onClick((): void => { this.themeMode = index; })
             })
@@ -646,7 +639,7 @@ struct OnlineReader {
           .margin({ top: 20, bottom: 10 })
           Text('在线阅读不会保存书签、笔记和进度，下载到书架后可使用完整本地阅读功能。')
             .fontSize(12)
-            .fontColor('#7B8780')
+            .fontColor($r('app.color.ui_text_muted'))
             .width('100%')
         }
         .width('100%')
@@ -655,7 +648,7 @@ struct OnlineReader {
         .width('100%')
         .height(this.settingsPanelHeight())
         .scrollBar(BarState.Off)
-        .backgroundColor('#FFFFFF')
+        .backgroundColor($r('app.color.ui_surface'))
         .borderRadius({ topLeft: 22, topRight: 22 })
         .shadow({ radius: 22, color: '#33000000', offsetY: -4 })
       }
@@ -670,7 +663,7 @@ struct OnlineReader {
     Row() {
       Text('‹')
         .fontSize(34)
-        .fontColor('#F0ECE6')
+        .fontColor($r('app.color.ui_reader_controls_text'))
         .width(48)
         .height(48)
         .textAlign(TextAlign.Center)
@@ -679,12 +672,12 @@ struct OnlineReader {
         Text(this.bookTitle)
           .fontSize(16)
           .fontWeight(FontWeight.Medium)
-          .fontColor('#F0ECE6')
+          .fontColor($r('app.color.ui_reader_controls_text'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
         Text(`${this.sourceName} · 在线阅读`)
           .fontSize(11)
-          .fontColor('#B8B3AD')
+          .fontColor($r('app.color.ui_reader_controls_secondary'))
           .maxLines(1)
       }
       .layoutWeight(1)
@@ -694,7 +687,7 @@ struct OnlineReader {
     .height(88)
     .width('100%')
     .padding({ left: 8, right: 8, top: 28 })
-    .backgroundColor('#E61E1A19')
+    .backgroundColor($r('app.color.ui_reader_controls'))
     .opacity(this.controlsProgress)
     .translate({ y: (this.controlsProgress - 1) * 88 })
     .position({ x: 0, y: 0 })
@@ -730,7 +723,7 @@ struct OnlineReader {
         .onClick((): void => this.nextPage())
       Text('设置')
         .fontSize(15)
-        .fontColor('#F0ECE6')
+        .fontColor($r('app.color.ui_reader_controls_text'))
         .width('25%')
         .height(54)
         .textAlign(TextAlign.Center)
@@ -739,7 +732,7 @@ struct OnlineReader {
     .height(64)
     .width('100%')
     .padding({ bottom: 10 })
-    .backgroundColor('#E61E1A19')
+    .backgroundColor($r('app.color.ui_reader_controls'))
     .border({ width: { top: 0.5 }, color: '#66807B76' })
     .opacity(this.controlsProgress)
     .translate({ y: (1 - this.controlsProgress) * 64 })

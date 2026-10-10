@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { LibraryStore } from '../data/LibraryStore';
+import { OnlineDownloadManager } from '../data/OnlineDownloadManager';
 import { BookRecord, ImportResult, ParsedBook } from '../model/Models';
 import { EpubParser } from './EpubParser';
 import { TxtParser } from './TxtParser';
@@ -43,6 +44,9 @@ export class BookImporter {
           item.author.trim().toLowerCase() === parsed.author.trim().toLowerCase() &&
           item.fileType === parsed.fileType);
         if (existing !== undefined) {
+          if (OnlineDownloadManager.shared().isRunning()) {
+            throw new Error('已有下载任务，请先完成或取消下载，再替换同名书籍');
+          }
           BookImporter.updateExistingBook(context, existing, parsed, originalPath, extension);
           LibraryStore.deleteBookFiles(context, bookId);
           result.updatedCount++;
@@ -92,6 +96,10 @@ export class BookImporter {
     book.originalFilePath = originalPath;
     book.chapterFilePath = chapterPath;
     book.totalChapters = parsed.chapters.length;
+    book.availableChapters = parsed.chapters.length;
+    book.downloadComplete = true;
+    book.downloadKey = '';
+    book.downloadRevision = (book.downloadRevision ?? 0) + 1;
     book.currentChapterIndex = Math.max(0, Math.min(book.currentChapterIndex, parsed.chapters.length - 1));
     book.currentPageIndex = 0;
     book.scrollOffset = 0;
