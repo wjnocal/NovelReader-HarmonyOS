@@ -6,9 +6,15 @@ const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
   private mainWindow: window.Window | undefined = undefined;
+  private onAvoidAreaChanged = (options: window.AvoidAreaOptions): void => {
+    if (options.type === window.AvoidAreaType.TYPE_CUTOUT || options.type === window.AvoidAreaType.TYPE_SYSTEM) {
+      this.updateReaderTopInset();
+    }
+  };
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppStorage.setOrCreate<boolean>('appInForeground', true);
+    AppStorage.setOrCreate<number>('readerTopInsetPx', 0);
     AppStorage.setOrCreate<string>('onlineDownloadStatus', 'idle');
     AppStorage.setOrCreate<string>('onlineDownloadMessage', '');
     AppStorage.setOrCreate<number>('onlineDownloadCompleted', 0);
@@ -55,6 +61,19 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
+  private updateReaderTopInset(): void {
+    if (this.mainWindow === undefined) return;
+    try {
+      const cutout = this.mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT).topRect;
+      const system = this.mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM).topRect;
+      const cutoutBottom = cutout.height > 0 ? cutout.top + cutout.height : 0;
+      const systemBottom = system.height > 0 ? system.top + system.height : 0;
+      AppStorage.setOrCreate<number>('readerTopInsetPx', Math.max(cutoutBottom, systemBottom));
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'Failed to query reader camera inset: %{public}s', String(err));
+    }
+  }
+
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     this.handleReaderWant(want);
   }
@@ -74,6 +93,8 @@ export default class EntryAbility extends UIAbility {
       mainWindow.setWindowLayoutFullScreen(true);
       // Keep the gesture/navigation area available, but hide the top status bar on every page.
       mainWindow.setWindowSystemBarEnable(['navigation']);
+      this.updateReaderTopInset();
+      mainWindow.on('avoidAreaChange', this.onAvoidAreaChanged);
       this.updateColorMode(this.context.config);
     } catch (err) {
       hilog.error(DOMAIN, 'testTag', 'Failed to enter immersive mode. Cause: %{public}s', JSON.stringify(err));
@@ -89,6 +110,11 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageDestroy(): void {
+    try {
+      this.mainWindow?.off('avoidAreaChange', this.onAvoidAreaChanged);
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'Failed to detach avoid-area listener: %{public}s', String(err));
+    }
     this.mainWindow = undefined;
     // Main window is destroyed, release UI related resources
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
@@ -97,6 +123,7 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void {
     // Ability has brought to foreground
     AppStorage.setOrCreate<boolean>('appInForeground', true);
+    this.updateReaderTopInset();
     this.updateColorMode(this.context.config);
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
   }

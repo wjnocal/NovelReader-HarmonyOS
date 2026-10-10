@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.wjnocal.novelreader",
     "vendor": "wjnocal",
-    "versionCode": 1020000,
-    "versionName": "1.2.0",
+    "versionCode": 1020500,
+    "versionName": "1.2.5",
     "buildVersion": "1",
     "icon": "$media:layered_image",
     "label": "$string:app_name"

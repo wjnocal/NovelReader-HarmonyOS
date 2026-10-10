@@ -2,10 +2,17 @@
 
 小说阅读器（NovelReader）的 HarmonyOS 版本，基于 ArkTS 与 ArkUI 开发，并持续同步 Android 版的主要功能与使用体验。
 
-- 当前版本：`1.2.0`（`versionCode 1020000`）
+- 当前版本：`1.2.5`（`versionCode 1020500`）
 - Bundle Name：`com.wjnocal.novelreader`
 - 支持设备：HarmonyOS 手机、平板
 - Android 版本：[wjnocal/NovelReader](https://github.com/wjnocal/NovelReader)
+
+## 1.2.5 更新重点
+
+- 新增华为官方沉浸光感：书架/主页底部导航及阅读页底部菜单使用悬浮玻璃材质，并提供系统交互光效。
+- 阅读页顶部改为独立的圆形返回键与居中的书名胶囊；点击书名仅显示系统光感反馈，不执行其他操作。
+- 阅读菜单呼出时覆盖正文，不额外预留菜单空间；顶部材质限制在两个按钮轮廓内，保留摄像头安全区适配。
+- 新版沉浸光感需要设备更新至 **HarmonyOS 7.0 及以上**，且设备支持并启用该系统材质；旧系统或不支持材质的设备使用兼容界面。
 
 ## 1.2.0 更新重点
 
@@ -56,10 +63,14 @@
 
 ## 开发环境
 
-- DevEco Studio `6.1.1`
-- HarmonyOS SDK `6.1.1 (API 24)`
+- DevEco Studio `26.0.0`（本地验证版本 `26.0.0.851`）
+- HarmonyOS SDK `26.0.0 (API 26)`
 - 最低兼容版本 `6.1.0 (API 23)`
 - ArkTS / ArkUI
+
+阅读页顶部与底部复用 API 26 官方悬浮材质容器，返回键与书名分别显示在圆形、胶囊形背板中。点击书名仅产生系统光感反馈，不执行跳转等操作；菜单呼出时覆盖正文，不为菜单额外留白。旧系统使用深浅色适配的普通背板。
+
+主页和本地阅读页底部导航在 API 26 上使用原生 `Tabs.barFloatingStyle` 与 `uiMaterial.ImmersiveMaterial`，提供新版系统交互光效；API 23–25 保留原有官方 HDS 悬浮导航。
 
 ## 项目结构
 
@@ -69,6 +80,7 @@ NovelReader/
 │  └─ app.json5                      # 应用信息与版本号
 ├─ entry/src/main/
 │  ├─ ets/
+│  │  ├─ components/                 # 官方阅读控件材质与兼容处理
 │  │  ├─ data/                       # 本地存储、在线书源、下载、导出、备份和 WebDAV
 │  │  ├─ entryability/               # 应用入口
 │  │  ├─ model/                      # 数据模型
@@ -141,6 +153,8 @@ ohos.permission.KEEP_BACKGROUND_RUNNING
 
 ## 验证
 
+- 运行 `node scripts/test-bottom-navigation.cjs` 和 `node scripts/test-reader-navigation.cjs`，检查主页、阅读底栏的 API 26 原生材质接入、旧系统分支和导航交互。
+- 运行 `node scripts/test-reader-top-controls.cjs`，检查新版 SDK 配置、顶部独立控件、摄像头避让及旧系统材质回退。沉浸光感的实际外观仍需 HarmonyOS 真机验证。
 - 运行 `node scripts/test-color-mode.cjs`，检查深浅色资源、输入框配色和深色对比度；阅读主题逻辑同时纳入鸿蒙单元测试。仍需真机验证系统切换和网页深色效果。
 - 在安装 Node.js 和 TypeScript 的环境运行 `node scripts/test-online-download.cjs`，验证本地模拟书源下的边下边看、续传、取消、缓存校验和多页边界。若无法自动找到 TypeScript，可用 `TYPESCRIPT_PATH` 指定其安装路径。
 - 在 DevEco Studio 的 Hvigor 任务中运行 `entry:test` 执行本地单元测试。

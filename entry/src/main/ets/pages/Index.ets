@@ -1,8 +1,10 @@
 import { common } from '@kit.AbilityKit';
-import { promptAction } from '@kit.ArkUI';
-import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
+import { promptAction, SymbolGlyphModifier } from '@kit.ArkUI';
+import { HdsTabs, HdsTabsController, hdsMaterial } from '@kit.UIDesignKit';
+import { BusinessError, deviceInfo, pasteboard } from '@kit.BasicServicesKit';
 import { ErrorText } from '../data/ErrorText';
 import { AppTheme } from '../data/AppTheme';
+import { ReaderControlMaterial } from '../components/ReaderControlMaterial';
 import { LibraryStore } from '../data/LibraryStore';
 import {
   BookRecord,
@@ -52,6 +54,7 @@ class ReaderTextRange {
 @Component
 struct Index {
   @StorageLink('systemDarkMode') private systemDarkMode: boolean = false;
+  @StorageLink('readerTopInsetPx') @Watch('onReaderTopInsetChanged') private readerTopInsetPx: number = 0;
   @State private page: string = 'shelf';
   @State private snapshot: LibrarySnapshot = new LibrarySnapshot();
   @State private books: Array<BookRecord> = new Array<BookRecord>();
@@ -66,13 +69,13 @@ struct Index {
   @State private noteDraft: string = '';
   @State private importing: boolean = false;
   @State private mainTab: string = 'shelf';
+  @State private navigationMaterialType: hdsMaterial.MaterialType = hdsMaterial.MaterialType.ADAPTIVE;
   @State private searchVisible: boolean = false;
   @State private searchQuery: string = '';
   @State private moreMenuVisible: boolean = false;
   @State private moreMenuProgress: number = 0;
   @State private gridMode: boolean = true;
   @State private sortMode: number = 0;
-  @State private pageProgress: number = 1;
   @State private readerProgress: number = 0;
   @State private catalogProgress: number = 0;
   @State private catalogScrimProgress: number = 0;
@@ -80,6 +83,7 @@ struct Index {
   @State private noteProgress: number = 0;
   @State private readerControlsVisible: boolean = false;
   @State private readerControlsProgress: number = 0;
+  @State private readerNavigationIndex: number = 0;
   @State private readerTextSize: number = 19;
   @State private readerLineHeight: number = 1.65;
   @State private readerThemeMode: number = 0;
@@ -131,6 +135,8 @@ struct Index {
   @State private readerSelectionMenuVisible: boolean = false;
   @State private readerSelectionColorVisible: boolean = false;
   private catalogAnimationToken: number = 0;
+  private mainTabsController: HdsTabsController = new HdsTabsController();
+  private navigationGlass: ReaderControlMaterial = new ReaderControlMaterial(true);
   private pageDragAnimationToken: number = 0;
   private pageTouchTracking: boolean = false;
   private pageTouchMoved: boolean = false;
@@ -148,11 +154,13 @@ struct Index {
   private noteSelectedText: string = '';
 
   aboutToAppear(): void {
+    this.updateNavigationMaterial();
     this.reloadLibrary();
     this.onOpenLocalBookRequested();
   }
 
   onPageShow(): void {
+    this.updateNavigationMaterial();
     this.onDownloadedChaptersChanged();
     this.onOpenLocalBookRequested();
   }
@@ -550,15 +558,56 @@ struct Index {
     if (tab === this.mainTab) {
       return;
     }
-    animateTo({ duration: 120, curve: Curve.EaseIn }, () => {
-      this.pageProgress = 0;
-    });
-    setTimeout(() => {
-      this.mainTab = tab;
-      animateTo({ duration: 260, curve: Curve.EaseOut }, () => {
-        this.pageProgress = 1;
-      });
-    }, 125);
+    this.mainTab = tab;
+    this.mainTabsController.changeIndex(tab === 'shelf' ? 0 : 1);
+  }
+
+  private navigationBarStyle(icon: Resource, label: string): BottomTabBarStyle {
+    const textColor: ResourceColor = $r('sys.color.font_primary');
+    return BottomTabBarStyle.of({
+      normal: new SymbolGlyphModifier(icon).fontColor([textColor]),
+      selected: new SymbolGlyphModifier(icon).fontColor([textColor])
+    }, label)
+      .layoutMode(LayoutMode.HORIZONTAL)
+      .labelStyle({ font: { size: 16 }, selectedColor: textColor, unselectedColor: textColor });
+  }
+
+  private updateNavigationMaterial(): void {
+    try {
+      const supported = hdsMaterial.getSystemMaterialTypes();
+      this.navigationMaterialType = supported.includes(hdsMaterial.MaterialType.IMMERSIVE) ?
+        hdsMaterial.MaterialType.IMMERSIVE : hdsMaterial.MaterialType.ADAPTIVE;
+    } catch (error) {
+      this.navigationMaterialType = hdsMaterial.MaterialType.ADAPTIVE;
+      console.warn(`Cannot query navigation material capability: ${String(error)}`);
+    }
+  }
+
+  private readerNavigationStyle(icon: Resource, label: string, marked: boolean = false): BottomTabBarStyle {
+    const textColor: ResourceColor = marked ? $r('app.color.ui_text_accent') : $r('sys.color.font_primary');
+    return BottomTabBarStyle.of({
+      normal: new SymbolGlyphModifier(icon).fontColor([textColor]),
+      selected: new SymbolGlyphModifier(icon).fontColor([textColor])
+    }, label)
+      .layoutMode(LayoutMode.VERTICAL)
+      .labelStyle({ font: { size: 13 }, selectedColor: textColor, unselectedColor: textColor });
+  }
+
+  private handleReaderNavigation(index: number): void {
+    if (!this.readerControlsVisible || index < 0 || index > 3) {
+      return;
+    }
+    this.readerNavigationIndex = index;
+    if (index === 0) {
+      this.openCatalog();
+    } else if (index === 1) {
+      this.toggleBookmark();
+    } else if (index === 2) {
+      promptAction.openToast({ message: '长按正文并拖动选择文字，可添加标记或笔记。' })
+        .catch((error: BusinessError) => console.warn(`Cannot show reader selection hint: ${error.message}`));
+    } else if (index === 3) {
+      this.openSettings();
+    }
   }
 
   private toggleMoreMenu(): void {
@@ -825,7 +874,22 @@ struct Index {
 
   private readerSafeTop(): number {
     // Reserve a full text line plus a fixed guard for centered/pill-shaped camera cutouts.
-    return Math.max(56, Math.round(this.readerTextSize * this.readerLineHeight + this.readerPageMargin + 12));
+    // Menus overlay the book; reserve only the camera area, not the control height.
+    return Math.max(56, this.readerControlsTop() + 12,
+      Math.round(this.readerTextSize * this.readerLineHeight + this.readerPageMargin + 12));
+  }
+
+  private onReaderTopInsetChanged(): void {
+    if (this.page === 'reader' && this.chapters.length > 0) this.rebuildReaderPages();
+  }
+
+  private readerControlsTop(): number {
+    return Math.max(32, this.getUIContext().px2vp(this.readerTopInsetPx) + 8);
+  }
+
+  private readerTitleWidth(): number {
+    // Keep the capsule centered on the screen, with space for the back button on either side.
+    return Math.max(48, Math.min(280, this.readerViewportWidth - 160));
   }
 
   private isReaderLandscape(): boolean {
@@ -1896,6 +1960,288 @@ struct Index {
   }
 
   @Builder
+  private BookshelfContent() {
+    Column() {
+      Row() {
+        Text(`累计阅读${this.formatMinutes(this.totalReadingMillis())}`)
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.ui_text_primary'))
+          .layoutWeight(1)
+        Text(`连续${this.readingStreak()}天`)
+          .fontSize(12)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.ui_text_on_accent'))
+          .textAlign(TextAlign.Center)
+          .width(72)
+          .height(30)
+          .borderRadius(15)
+          .backgroundColor($r('app.color.ui_brand_background'))
+        Text('◷')
+          .fontSize(25)
+          .fontColor($r('app.color.ui_text_primary'))
+          .textAlign(TextAlign.Center)
+          .width(42)
+          .onClick(() => this.openUtility('history'))
+        Text(this.searchVisible ? '×' : '⌕')
+          .fontSize(30)
+          .fontColor($r('app.color.ui_text_primary'))
+          .textAlign(TextAlign.Center)
+          .width(48)
+          .onClick(() => {
+            animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
+              this.searchVisible = !this.searchVisible;
+              if (!this.searchVisible) {
+                this.searchQuery = '';
+              }
+            });
+          })
+        Text('···')
+          .fontSize(30)
+          .fontColor($r('app.color.ui_text_primary'))
+          .textAlign(TextAlign.Center)
+          .width(48)
+          .onClick(() => this.toggleMoreMenu())
+      }
+      .height(64)
+      .width('100%')
+
+      if (this.searchVisible) {
+        TextInput({ text: this.searchQuery, placeholder: '搜索书名、作者、分类或简介' })
+          .height(44)
+          .fontSize(16)
+          .fontColor($r('app.color.ui_text_primary'))
+          .placeholderColor($r('app.color.ui_text_muted'))
+          .caretColor($r('app.color.ui_text_accent'))
+          .backgroundColor($r('app.color.ui_shelf_input'))
+          .borderRadius(22)
+          .padding({ left: 18, right: 18 })
+          .margin({ bottom: 12 })
+          .onChange((value: string) => this.searchQuery = value)
+      }
+
+      if (this.visibleBooks().length === 0) {
+        Column() {
+          Text(this.searchQuery.length > 0 ? '没有匹配的书籍' :
+            (this.categoryFilter !== '全部' ? '当前筛选下没有书籍' : '书架还是空的'))
+            .fontSize(20)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('app.color.ui_text_body'))
+          Button(this.searchQuery.length > 0 ? '清除搜索' :
+            (this.categoryFilter !== '全部' ? '查看全部书籍' : '本机导入'))
+            .fontColor($r('app.color.ui_text_primary'))
+            .backgroundColor($r('app.color.ui_shelf_card'))
+            .margin({ top: 18 })
+            .onClick(() => {
+              if (this.searchQuery.length > 0) {
+                this.searchQuery = '';
+              } else if (this.categoryFilter !== '全部') {
+                this.categoryFilter = '全部';
+              } else {
+                this.importBooks();
+              }
+            })
+        }
+        .justifyContent(FlexAlign.Center)
+        .width('100%')
+        .layoutWeight(1)
+      } else if (this.gridMode) {
+        Grid() {
+          ForEach(this.visibleBooks(), (book: BookRecord) => {
+            GridItem() {
+              Column() {
+                Stack({ alignContent: Alignment.TopEnd }) {
+                  Column() {
+                    Text(book.title.substring(0, Math.min(12, book.title.length)))
+                      .fontSize(17)
+                      .fontWeight(FontWeight.Bold)
+                      .fontColor($r('app.color.ui_text_primary'))
+                      .textAlign(TextAlign.Center)
+                      .maxLines(3)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(`${book.author} · ${book.fileType.toUpperCase()}`)
+                      .fontSize(12)
+                      .fontColor($r('app.color.ui_text_body'))
+                      .maxLines(1)
+                      .margin({ top: 14 })
+                  }
+                  .justifyContent(FlexAlign.Center)
+                  .width('100%')
+                  .height(142)
+                  .backgroundColor($r('app.color.ui_surface_button'))
+                  if (book.pinnedAt > 0) {
+                    Text('◆')
+                      .fontSize(20)
+                      .fontColor($r('app.color.ui_brand'))
+                      .margin({ top: 4, right: 6 })
+                  }
+                }
+                Text(book.title)
+                  .fontSize(16)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor($r('app.color.ui_text_primary'))
+                  .maxLines(2)
+                  .width('100%')
+                  .margin({ top: 10 })
+                Text(`阅读进度 ${this.chapterProgress(book)}% · ${book.totalChapters}章`)
+                  .fontSize(12)
+                  .fontColor($r('app.color.ui_text_body'))
+                  .maxLines(1)
+                  .width('100%')
+                  .margin({ top: 4 })
+              }
+              .padding(8)
+              .width('100%')
+              .backgroundColor($r('app.color.ui_shelf_card'))
+              .borderRadius(4)
+              .border({ width: 1, color: $r('app.color.ui_border') })
+              .shadow({ radius: 7, color: '#33000000', offsetY: 3 })
+              .onClick(() => this.openBook(book))
+              .gesture(LongPressGesture().onAction(() => {
+                this.openBookActions(book);
+              }))
+            }
+          }, (book: BookRecord) => this.bookRenderKey(book))
+          GridItem() {
+            Column().height(100)
+          }
+          .columnStart(0)
+          .columnEnd(1)
+          .height(100)
+        }
+        .columnsTemplate('1fr 1fr')
+        .columnsGap(12)
+        .rowsGap(28)
+        .padding({ left: 2, right: 2, top: 8, bottom: 16 })
+        .layoutWeight(1)
+      } else {
+        List({ space: 12 }) {
+          ForEach(this.visibleBooks(), (book: BookRecord) => {
+            ListItem() {
+              Column() {
+                Row() {
+                  Text(book.title)
+                    .fontSize(17)
+                    .fontWeight(FontWeight.Bold)
+                    .fontColor($r('app.color.ui_text_primary'))
+                    .maxLines(2)
+                    .layoutWeight(1)
+                  Text(book.pinnedAt > 0 ? '◆' : '')
+                    .fontColor($r('app.color.ui_brand'))
+                }
+                Text(`${book.author} · ${book.fileType.toUpperCase()} · ${book.totalChapters}章`)
+                  .fontSize(14)
+                  .fontColor($r('app.color.ui_text_body'))
+                  .width('100%')
+                  .margin({ top: 6 })
+                Text(`阅读进度 ${this.chapterProgress(book)}%`)
+                  .fontSize(12)
+                  .fontColor($r('app.color.ui_text_body'))
+                  .width('100%')
+                  .margin({ top: 10 })
+              }
+              .padding(16)
+              .width('100%')
+              .backgroundColor($r('app.color.ui_shelf_card'))
+              .borderRadius(8)
+              .border({ width: 1, color: $r('app.color.ui_border') })
+              .onClick(() => this.openBook(book))
+              .gesture(LongPressGesture().onAction(() => {
+                this.openBookActions(book);
+              }))
+            }
+          }, (book: BookRecord) => this.bookRenderKey(book))
+        }
+        .layoutWeight(1)
+        .contentEndOffset(100)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 20, right: 20 })
+    .safeAreaPadding({ top: 8 })
+  }
+
+  @Builder
+  private MainNavigationContents() {
+    TabContent() {
+      this.BookshelfContent()
+    }
+    .tabBar(this.navigationBarStyle($r('sys.symbol.bookshelf'), '书架'))
+
+    TabContent() {
+      Column() {
+        this.HomePage()
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: 20, right: 20 })
+      .safeAreaPadding({ top: 8 })
+    }
+    .tabBar(this.navigationBarStyle($r('sys.symbol.house'), '主页'))
+  }
+
+  @Builder
+  private MainNavigation() {
+    if (deviceInfo.sdkApiVersion >= 26) {
+      Tabs({
+        barPosition: BarPosition.End,
+        index: this.mainTab === 'shelf' ? 0 : 1,
+        controller: this.mainTabsController
+      }) {
+        this.MainNavigationContents()
+      }
+      .width('100%')
+      .height('100%')
+      .safeAreaPadding({ bottom: 8 })
+      .vertical(false)
+      .scrollable(false)
+      .barOverlap(true)
+      .barPosition(BarPosition.End)
+      .barFloatingStyle({
+        barWidth: { smallBarWidth: 280, mediumBarWidth: 360, largeBarWidth: 440 },
+        barSideMargin: 20,
+        barBottomMargin: 12,
+        systemMaterial: this.navigationGlass.getMaterial()
+      })
+      .animationDuration(240)
+      .onChange((index: number) => {
+        this.mainTab = index === 0 ? 'shelf' : 'home';
+      })
+    } else {
+      // Keep the previous official HDS integration exclusively for API 23–25 devices.
+      HdsTabs({
+        barPosition: BarPosition.End,
+        index: this.mainTab === 'shelf' ? 0 : 1,
+        controller: this.mainTabsController
+      }) {
+        this.MainNavigationContents()
+      }
+      .width('100%')
+      .height('100%')
+      .safeAreaPadding({ bottom: 8 })
+      .vertical(false)
+      .scrollable(false)
+      .barOverlap(true)
+      .barPosition(BarPosition.End)
+      .barFloatingStyle({
+        barWidth: { smallWidth: 280, mediumWidth: 360, largeWidth: 440 },
+        barSideMargin: 20,
+        barBottomMargin: 12,
+        systemMaterialEffect: {
+          materialType: this.navigationMaterialType,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
+        },
+        thermoCtrl: true
+      })
+      .animationDuration(240)
+      .onChange((index: number) => {
+        this.mainTab = index === 0 ? 'shelf' : 'home';
+      })
+    }
+  }
+
+  @Builder
   private ShelfPage() {
     Stack({ alignContent: Alignment.TopEnd }) {
       Image($r('app.media.bookshelf_bg'))
@@ -1904,233 +2250,7 @@ struct Index {
         .objectFit(ImageFit.Cover)
         .opacity(this.systemDarkMode ? 0 : this.backgroundOpacity)
 
-      Column() {
-        if (this.mainTab === 'shelf') {
-          Column() {
-            Row() {
-              Text(`累计阅读${this.formatMinutes(this.totalReadingMillis())}`)
-                .fontSize(16)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.ui_text_primary'))
-                .layoutWeight(1)
-              Text(`连续${this.readingStreak()}天`)
-                .fontSize(12)
-                .fontWeight(FontWeight.Bold)
-                .fontColor($r('app.color.ui_text_on_accent'))
-                .textAlign(TextAlign.Center)
-                .width(72)
-                .height(30)
-                .borderRadius(15)
-                .backgroundColor($r('app.color.ui_brand_background'))
-              Text('◷')
-                .fontSize(25)
-                .fontColor($r('app.color.ui_text_primary'))
-                .textAlign(TextAlign.Center)
-                .width(42)
-                .onClick(() => this.openUtility('history'))
-              Text(this.searchVisible ? '×' : '⌕')
-                .fontSize(30)
-                .fontColor($r('app.color.ui_text_primary'))
-                .textAlign(TextAlign.Center)
-                .width(48)
-                .onClick(() => {
-                  animateTo({ duration: 220, curve: Curve.EaseOut }, () => {
-                    this.searchVisible = !this.searchVisible;
-                    if (!this.searchVisible) {
-                      this.searchQuery = '';
-                    }
-                  });
-                })
-              Text('···')
-                .fontSize(30)
-                .fontColor($r('app.color.ui_text_primary'))
-                .textAlign(TextAlign.Center)
-                .width(48)
-                .onClick(() => this.toggleMoreMenu())
-            }
-            .height(64)
-            .width('100%')
-
-            if (this.searchVisible) {
-              TextInput({ text: this.searchQuery, placeholder: '搜索书名、作者、分类或简介' })
-                .height(44)
-                .fontSize(16)
-                .fontColor($r('app.color.ui_text_primary'))
-                .placeholderColor($r('app.color.ui_text_muted'))
-                .caretColor($r('app.color.ui_text_accent'))
-                .backgroundColor($r('app.color.ui_shelf_input'))
-                .borderRadius(22)
-                .padding({ left: 18, right: 18 })
-                .margin({ bottom: 12 })
-                .onChange((value: string) => this.searchQuery = value)
-            }
-
-            if (this.visibleBooks().length === 0) {
-              Column() {
-                Text(this.searchQuery.length > 0 ? '没有匹配的书籍' :
-                  (this.categoryFilter !== '全部' ? '当前筛选下没有书籍' : '书架还是空的'))
-                  .fontSize(20)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor($r('app.color.ui_text_body'))
-                Button(this.searchQuery.length > 0 ? '清除搜索' :
-                  (this.categoryFilter !== '全部' ? '查看全部书籍' : '本机导入'))
-                  .fontColor($r('app.color.ui_text_primary'))
-                  .backgroundColor($r('app.color.ui_shelf_card'))
-                  .margin({ top: 18 })
-                  .onClick(() => {
-                    if (this.searchQuery.length > 0) {
-                      this.searchQuery = '';
-                    } else if (this.categoryFilter !== '全部') {
-                      this.categoryFilter = '全部';
-                    } else {
-                      this.importBooks();
-                    }
-                  })
-              }
-              .justifyContent(FlexAlign.Center)
-              .width('100%')
-              .layoutWeight(1)
-            } else if (this.gridMode) {
-              Grid() {
-                ForEach(this.visibleBooks(), (book: BookRecord) => {
-                  GridItem() {
-                    Column() {
-                      Stack({ alignContent: Alignment.TopEnd }) {
-                        Column() {
-                          Text(book.title.substring(0, Math.min(12, book.title.length)))
-                            .fontSize(17)
-                            .fontWeight(FontWeight.Bold)
-                            .fontColor($r('app.color.ui_text_primary'))
-                            .textAlign(TextAlign.Center)
-                            .maxLines(3)
-                            .textOverflow({ overflow: TextOverflow.Ellipsis })
-                          Text(`${book.author} · ${book.fileType.toUpperCase()}`)
-                            .fontSize(12)
-                            .fontColor($r('app.color.ui_text_body'))
-                            .maxLines(1)
-                            .margin({ top: 14 })
-                        }
-                        .justifyContent(FlexAlign.Center)
-                        .width('100%')
-                        .height(142)
-                        .backgroundColor($r('app.color.ui_surface_button'))
-                        if (book.pinnedAt > 0) {
-                          Text('◆')
-                            .fontSize(20)
-                            .fontColor($r('app.color.ui_brand'))
-                            .margin({ top: 4, right: 6 })
-                        }
-                      }
-                      Text(book.title)
-                        .fontSize(16)
-                        .fontWeight(FontWeight.Bold)
-                        .fontColor($r('app.color.ui_text_primary'))
-                        .maxLines(2)
-                        .width('100%')
-                        .margin({ top: 10 })
-                      Text(`阅读进度 ${this.chapterProgress(book)}% · ${book.totalChapters}章`)
-                        .fontSize(12)
-                        .fontColor($r('app.color.ui_text_body'))
-                        .maxLines(1)
-                        .width('100%')
-                        .margin({ top: 4 })
-                    }
-                    .padding(8)
-                    .width('100%')
-                    .backgroundColor($r('app.color.ui_shelf_card'))
-                    .borderRadius(4)
-                    .border({ width: 1, color: $r('app.color.ui_border') })
-                    .shadow({ radius: 7, color: '#33000000', offsetY: 3 })
-                    .onClick(() => this.openBook(book))
-                    .gesture(LongPressGesture().onAction(() => {
-                      this.openBookActions(book);
-                    }))
-                  }
-                }, (book: BookRecord) => this.bookRenderKey(book))
-              }
-              .columnsTemplate('1fr 1fr')
-              .columnsGap(12)
-              .rowsGap(28)
-              .padding({ left: 2, right: 2, top: 8, bottom: 16 })
-              .layoutWeight(1)
-            } else {
-              List({ space: 12 }) {
-                ForEach(this.visibleBooks(), (book: BookRecord) => {
-                  ListItem() {
-                    Column() {
-                      Row() {
-                        Text(book.title)
-                          .fontSize(17)
-                          .fontWeight(FontWeight.Bold)
-                          .fontColor($r('app.color.ui_text_primary'))
-                          .maxLines(2)
-                          .layoutWeight(1)
-                        Text(book.pinnedAt > 0 ? '◆' : '')
-                          .fontColor($r('app.color.ui_brand'))
-                      }
-                      Text(`${book.author} · ${book.fileType.toUpperCase()} · ${book.totalChapters}章`)
-                        .fontSize(14)
-                        .fontColor($r('app.color.ui_text_body'))
-                        .width('100%')
-                        .margin({ top: 6 })
-                      Text(`阅读进度 ${this.chapterProgress(book)}%`)
-                        .fontSize(12)
-                        .fontColor($r('app.color.ui_text_body'))
-                        .width('100%')
-                        .margin({ top: 10 })
-                    }
-                    .padding(16)
-                    .width('100%')
-                    .backgroundColor($r('app.color.ui_shelf_card'))
-                    .borderRadius(8)
-                    .border({ width: 1, color: $r('app.color.ui_border') })
-                    .onClick(() => this.openBook(book))
-                    .gesture(LongPressGesture().onAction(() => {
-                      this.openBookActions(book);
-                    }))
-                  }
-                }, (book: BookRecord) => this.bookRenderKey(book))
-              }
-              .layoutWeight(1)
-            }
-          }
-          .layoutWeight(1)
-          .width('100%')
-        } else {
-          this.HomePage()
-        }
-
-        Row() {
-          Text('书架')
-            .fontSize(16)
-            .fontWeight(this.mainTab === 'shelf' ? FontWeight.Bold : FontWeight.Normal)
-            .fontColor(this.mainTab === 'shelf' ? $r('app.color.ui_brand') : $r('app.color.ui_text_primary'))
-            .textAlign(TextAlign.Center)
-            .layoutWeight(1)
-            .height(52)
-            .onClick(() => this.switchMainTab('shelf'))
-          Text('主页')
-            .fontSize(16)
-            .fontWeight(this.mainTab === 'home' ? FontWeight.Bold : FontWeight.Normal)
-            .fontColor(this.mainTab === 'home' ? $r('app.color.ui_brand') : $r('app.color.ui_text_primary'))
-            .textAlign(TextAlign.Center)
-            .layoutWeight(1)
-            .height(52)
-            .onClick(() => this.switchMainTab('home'))
-        }
-        .width('100%')
-        .height(56)
-        .backgroundColor($r('app.color.ui_shelf_input'))
-        .borderRadius(28)
-        .margin({ bottom: 10 })
-        .shadow({ radius: 8, color: '#33000000', offsetY: 3 })
-      }
-      .padding({ left: 20, right: 20 })
-      .safeAreaPadding({ top: 8 })
-      .width('100%')
-      .height('100%')
-      .opacity(this.pageProgress)
-      .translate({ x: (1 - this.pageProgress) * (this.mainTab === 'shelf' ? -20 : 20) })
+      this.MainNavigation()
 
       if (this.moreMenuVisible) {
         Column() {
@@ -2316,7 +2436,7 @@ struct Index {
         })
       }
       .width('100%')
-      .padding({ top: 28, bottom: 24 })
+      .padding({ top: 28, bottom: 100 })
     }
     .layoutWeight(1)
     .width('100%')
@@ -3047,74 +3167,210 @@ struct Index {
   }
 
   @Builder
-  private ReaderTopControls() {
+  private ReaderBackIcon() {
     Row() {
-      Text('‹')
-        .fontSize(34)
-        .fontColor($r('app.color.ui_reader_controls_text'))
-        .width(48)
-        .onClick(() => this.closeReader())
-      Column() {
-        Text(this.currentBookTitle())
-          .fontSize(16)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.ui_reader_controls_text'))
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(`${this.chapterIndex + 1} / ${this.chapters.length}`)
-          .fontSize(11)
-          .fontColor($r('app.color.ui_reader_controls_secondary'))
-      }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Center)
-      Blank()
-        .width(48)
+      SymbolGlyph($r('sys.symbol.chevron_left'))
+        .fontSize(22)
+        .fontColor([$r('sys.color.font_primary')])
     }
-    .height(88)
     .width('100%')
-    .padding({ left: 8, right: 8, top: 28 })
-    .backgroundColor($r('app.color.ui_reader_controls'))
-    .opacity(this.readerControlsProgress)
-    .translate({ y: (this.readerControlsProgress - 1) * 88 })
-    .position({ x: 0, y: 0 })
+    .height(48)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  @Builder
+  private ReaderBookTitle() {
+    Column() {
+      Text(this.currentBookTitle())
+        .fontSize(16)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.font_primary'))
+        .width('100%')
+        .textAlign(TextAlign.Center)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text(`${this.chapterIndex + 1} / ${this.chapters.length}`)
+        .fontSize(11)
+        .fontColor($r('sys.color.font_secondary'))
+        .maxLines(1)
+    }
+    .width('100%')
+    .height(48)
+    .padding({ left: 16, right: 16 })
+    .justifyContent(FlexAlign.Center)
+    .alignItems(HorizontalAlign.Center)
+  }
+
+  @Builder
+  private ReaderFloatingLabel(title: boolean) {
+    if (title) {
+      this.ReaderBookTitle()
+    } else {
+      this.ReaderBackIcon()
+    }
+  }
+
+  private handleReaderTopControl(title: boolean): void {
+    // The title is a real native light-feedback target, but has no application action.
+    if (!title && this.readerControlsVisible) this.closeReader();
+  }
+
+  @Builder
+  private ReaderFloatingControl(title: boolean) {
+    Stack() {
+      if (deviceInfo.sdkApiVersion >= 26) {
+        // Use the same native floating material container as the working reader footer.
+        Tabs({ barPosition: BarPosition.End, index: 0 }) {
+          TabContent() {
+            Column()
+          }
+          .tabBar(this.ReaderFloatingLabel(title))
+        }
+        .width('100%')
+        .height('100%')
+        .barHeight(48, true)
+        .safeAreaPadding({ bottom: 0 })
+        .vertical(false)
+        .scrollable(false)
+        .barOverlap(true)
+        .barFloatingStyle({
+          barWidth: {
+            smallBarWidth: title ? this.readerTitleWidth() : 48,
+            mediumBarWidth: title ? this.readerTitleWidth() : 48,
+            largeBarWidth: title ? this.readerTitleWidth() : 48
+          },
+          barSideMargin: 0,
+          barBottomMargin: 0,
+          maskHeight: 0,
+          maskColor: Color.Transparent,
+          systemMaterial: this.navigationGlass.getMaterial()
+        })
+        .animationDuration(0)
+        .onTabBarClick(() => this.handleReaderTopControl(title))
+      } else {
+        Button({ type: title ? ButtonType.Capsule : ButtonType.Circle }) {
+          this.ReaderFloatingLabel(title)
+        }
+        .width(title ? this.readerTitleWidth() : 48)
+        .height(48)
+        .buttonStyle(ButtonStyleMode.NORMAL)
+        .backgroundColor($r('app.color.ui_surface'))
+        .onClick(() => this.handleReaderTopControl(title))
+      }
+    }
+    // Clip the native bar's surrounding mask to the control, not a rectangular header.
+    .width(title ? this.readerTitleWidth() : 48)
+    .height(48)
+    .borderRadius(24)
+    .clip(true)
+    .accessibilityGroup(true)
+    .accessibilityText(title ? `${this.currentBookTitle()}，${this.chapterIndex + 1} / ${this.chapters.length}` : '返回书架')
     .hitTestBehavior(this.readerControlsVisible ? HitTestMode.Default : HitTestMode.None)
   }
 
   @Builder
-  private ReaderBottomControls() {
-    Row() {
-      Text('目录')
-        .fontSize(15)
-        .fontColor($r('app.color.ui_reader_controls_text'))
-        .width('25%')
-        .textAlign(TextAlign.Center)
-        .onClick(() => this.openCatalog())
-      Text(this.isCurrentBookmarked() ? '已书签' : '书签')
-        .fontSize(15)
-        .fontColor(this.isCurrentBookmarked() ? '#D8A64A' : '#F0ECE6')
-        .width('25%')
-        .textAlign(TextAlign.Center)
-        .onClick(() => this.toggleBookmark())
-      Text(this.readerReadMode === 0 ? '长按标记' : '长按笔记')
-        .fontSize(13)
-        .fontColor($r('app.color.ui_reader_controls_secondary'))
-        .width('25%')
-        .textAlign(TextAlign.Center)
-      Text('设置')
-        .fontSize(15)
-        .fontColor($r('app.color.ui_reader_controls_text'))
-        .width('25%')
-        .textAlign(TextAlign.Center)
-        .onClick(() => this.openSettings())
+  private ReaderTopControls() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Stack() {
+        this.ReaderFloatingControl(false)
+      }
+      .width(48)
+      .height(48)
+      .position({ x: 16, y: this.readerControlsTop() })
+
+      Stack() {
+        this.ReaderFloatingControl(true)
+      }
+      .width(this.readerTitleWidth())
+      .height(48)
+      .position({ x: (this.readerViewportWidth - this.readerTitleWidth()) / 2,
+        y: this.readerControlsTop() })
     }
-    .height(64)
+    .height(this.readerControlsTop() + 60)
     .width('100%')
-    .padding({ bottom: 10 })
-    .backgroundColor($r('app.color.ui_reader_controls'))
-    .border({ width: { top: 0.5 }, color: '#66807B76' })
     .opacity(this.readerControlsProgress)
-    .translate({ y: (1 - this.readerControlsProgress) * 64 })
-    .position({ x: 0, y: Math.max(0, this.readerViewportHeight - 64) })
+    .translate({ y: (this.readerControlsProgress - 1) * (this.readerControlsTop() + 60) })
+    .position({ x: 0, y: 0 })
+    .accessibilityLevel(this.readerControlsVisible ? 'auto' : 'no-hide-descendants')
+    .hitTestBehavior(this.readerControlsVisible ? HitTestMode.Transparent : HitTestMode.None)
+  }
+
+  @Builder
+  private ReaderNavigationContents() {
+      TabContent() {
+        Column()
+      }
+      .tabBar(this.readerNavigationStyle($r('sys.symbol.list_bullet'), '目录'))
+      TabContent() {
+        Column()
+      }
+      .tabBar(this.readerNavigationStyle($r('sys.symbol.bookmark'),
+        this.isCurrentBookmarked() ? '已书签' : '书签', this.isCurrentBookmarked()))
+      TabContent() {
+        Column()
+      }
+      .tabBar(this.readerNavigationStyle($r('sys.symbol.pencil_tip'),
+        this.readerReadMode === 0 ? '长按标记' : '长按笔记'))
+      TabContent() {
+        Column()
+      }
+      .tabBar(this.readerNavigationStyle($r('sys.symbol.gearshape'), '设置'))
+  }
+
+  @Builder
+  private ReaderBottomControls() {
+    // Only the footer belongs to these tabs; the reading viewport is not a tab page.
+    Stack() {
+      if (deviceInfo.sdkApiVersion >= 26) {
+        Tabs({ barPosition: BarPosition.End, index: this.readerNavigationIndex }) {
+          this.ReaderNavigationContents()
+        }
+        .width('100%')
+        .height('100%')
+        .safeAreaPadding({ bottom: 8 })
+        .vertical(false)
+        .scrollable(false)
+        .barOverlap(true)
+        .barPosition(BarPosition.End)
+        .barFloatingStyle({
+          barWidth: { smallBarWidth: 320, mediumBarWidth: 420, largeBarWidth: 520 },
+          barSideMargin: 16,
+          barBottomMargin: 12,
+          systemMaterial: this.navigationGlass.getMaterial()
+        })
+        .animationDuration(180)
+        .onTabBarClick((index: number) => this.handleReaderNavigation(index))
+      } else {
+        HdsTabs({ barPosition: BarPosition.End, index: this.readerNavigationIndex }) {
+          this.ReaderNavigationContents()
+        }
+        .width('100%')
+        .height('100%')
+        .safeAreaPadding({ bottom: 8 })
+        .vertical(false)
+        .scrollable(false)
+        .barOverlap(true)
+        .barPosition(BarPosition.End)
+        .barFloatingStyle({
+          barWidth: { smallWidth: 320, mediumWidth: 420, largeWidth: 520 },
+          barSideMargin: 16,
+          barBottomMargin: 12,
+          systemMaterialEffect: {
+            materialType: this.navigationMaterialType,
+            materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE
+          },
+          thermoCtrl: true
+        })
+        .animationDuration(180)
+        .onTabBarClick((index: number) => this.handleReaderNavigation(index))
+      }
+    }
+    .width('100%')
+    .height(132)
+    .opacity(this.readerControlsProgress)
+    .translate({ y: (1 - this.readerControlsProgress) * 132 })
+    .position({ x: 0, y: Math.max(0, this.readerViewportHeight - 132) })
+    .accessibilityLevel(this.readerControlsVisible ? 'auto' : 'no-hide-descendants')
     .hitTestBehavior(this.readerControlsVisible ? HitTestMode.Default : HitTestMode.None)
   }
 
